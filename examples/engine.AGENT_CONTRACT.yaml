@@ -1,0 +1,21 @@
+version: 1
+module: engine
+claims:
+  - id: engine.no_test_case_heuristics
+    text: I did not add heuristics specific to a single test case.
+    review:
+      - List each production branch added or changed.
+      - Explain why each branch generalizes beyond the regression fixture.
+      - Name the test or check that would fail if the logic were hard-coded.
+
+  - id: engine.execution_semantics_preserved
+    text: I preserved lifecycle and execution semantics for existing callers.
+    review:
+      - List any changed state transition, retry behavior, cancellation path, or ordering guarantee.
+      - Explain why existing callers remain compatible.
+
+  - id: engine.validation_covers_new_surface
+    text: I added validation for each new execution surface.
+    review:
+      - List each new branch, mode, input shape, or extension point.
+      - Name the test, property check, or fixture covering it.

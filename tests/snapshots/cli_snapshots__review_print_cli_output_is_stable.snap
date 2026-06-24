@@ -1,0 +1,56 @@
+---
+source: tests/cli_snapshots.rs
+expression: output
+---
+Wrote review worksheet to <REVIEW_PATH>
+Review 3 claim(s), set every status to true, and add evidence before signing.
+
+kind: attest.review.v1
+generated_at: <TIMESTAMP>
+base_ref: HEAD~1
+base_sha: <SHA>
+merge_base_sha: <SHA>
+head_sha: <SHA>
+diff_digest: blake3:<DIGEST>
+items:
+- contract_path: AGENT_CONTRACT.yaml
+  contract_digest: blake3:<DIGEST>
+  module: repo
+  source: directory
+  claim_id: repo.parent_reviewed
+  claim: I reviewed the repository-level impact.
+  review_questions: []
+  changed_files:
+  - crates/engine/src/lib.rs
+  evidence_required: true
+  evidence: []
+- contract_path: crates/engine/AGENT_CONTRACT.yaml
+  contract_digest: blake3:<DIGEST>
+  module: engine
+  source: directory
+  claim_id: engine.subfolder_reviewed
+  claim: I reviewed the engine-level impact.
+  review_questions: []
+  changed_files:
+  - crates/engine/src/lib.rs
+  evidence_required: true
+  evidence: []
+- contract_path: crates/engine/src/lib.rs#attest:engine.guarded
+  contract_digest: blake3:<DIGEST>
+  module: engine
+  source: inline
+  target:
+    kind: function
+    path: crates/engine/src/lib.rs
+    symbol: guarded
+    start_line: 9
+    end_line: 14
+    contract_start_line: 1
+    contract_end_line: 8
+  claim_id: engine.no_test_case_heuristics
+  claim: guarded does not add fixture-specific logic.
+  review_questions: []
+  changed_files:
+  - crates/engine/src/lib.rs
+  evidence_required: true
+  evidence: []

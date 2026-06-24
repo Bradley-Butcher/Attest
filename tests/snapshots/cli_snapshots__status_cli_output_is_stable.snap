@@ -1,0 +1,19 @@
+---
+source: tests/cli_snapshots.rs
+expression: output
+---
+Base: HEAD~1 (<SHORT_SHA>)
+Head: <SHORT_SHA>
+Diff: blake3:<DIGEST>
+Changed files:
+  - crates/engine/src/lib.rs
+Required contracts:
+  - repo (AGENT_CONTRACT.yaml, scope: <repo>)
+      - repo.parent_reviewed
+  - engine (crates/engine/AGENT_CONTRACT.yaml, scope: crates/engine)
+      - engine.subfolder_reviewed
+  - engine (crates/engine/src/lib.rs#attest:engine.guarded, scope: crates/engine/src/lib.rs:guarded)
+      target: function guarded lines 9-14
+      - engine.no_test_case_heuristics
+Attest verification: blocked
+blocker: missing PR attestation at <ATTESTATION_PATH>; run `attest review-pr` and `attest sign-pr --from-review`

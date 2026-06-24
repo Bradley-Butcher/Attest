@@ -1,0 +1,30 @@
+version: 1
+module: attest-core
+claims:
+  - id: attest_core.model_stays_explainable
+    text: A contributor can explain why each contract became active from PR scope, contract scope, and changed code without reading unrelated subsystems.
+    review:
+      - Describe the activation story for directory contracts in one short paragraph.
+      - Describe the activation story for inline contracts in one short paragraph.
+      - Identify any branch where the reason a contract is active would surprise a user reading the contract location.
+
+  - id: attest_core.policy_not_hidden_in_plumbing
+    text: Product policy lives in explicit contract, review, signing, or verification concepts, not hidden inside parsing, caching, Git plumbing, or transport glue.
+    review:
+      - List every place this change decides whether review is required, optional, blocked, or stale.
+      - Explain why each decision belongs at that layer.
+      - Name any policy that should be elevated into contract format, verifier state, or user-facing output.
+
+  - id: attest_core_failure_modes_match_user_expectations
+    text: Ambiguous source structure, stale state, moved code, malformed contracts, and missing evidence fail in the direction a careful maintainer would expect.
+    review:
+      - List every new or changed failure mode.
+      - For each one, say whether the user sees acceptance, warning, or block.
+      - Explain why that outcome protects product trust without creating avoidable review noise.
+
+  - id: attest_core_optimizations_are_not_authority
+    text: Performance optimizations such as sentinel scans, ancestor lookup, and blob caches do not become the source of truth for required signoffs.
+    review:
+      - List every optimization used before a contract is activated.
+      - Explain what authoritative source overrides or validates that optimization.
+      - Confirm stale, corrupt, missing, or incomplete optimized data cannot make a required review disappear.

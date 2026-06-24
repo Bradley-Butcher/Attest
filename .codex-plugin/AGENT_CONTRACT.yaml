@@ -1,0 +1,23 @@
+version: 1
+module: attest-plugin
+claims:
+  - id: attest_plugin_install_story_is_plain
+    text: Plugin metadata, hooks, skills, and MCP configuration make the install story plain instead of hiding setup, trust, or runtime assumptions.
+    review:
+      - List every plugin-facing file changed by this PR.
+      - Explain what the user must install, trust, or configure separately.
+      - Identify any description, prompt, or default that makes Attest sound more automatic than it is.
+
+  - id: attest_plugin_agent_guidance_preserves_accountability
+    text: Agent-facing plugin guidance tells the agent to inspect truth and evidence, not to satisfy a checkbox or sign by default.
+    review:
+      - List every changed skill instruction, default prompt, hook message, or MCP instruction.
+      - Explain how the guidance handles false, unsure, stale, or missing evidence.
+      - Remove wording that treats signing as a mechanical follow-up to a stale-attestation warning.
+
+  - id: attest_plugin_surface_area_matches_product_shape
+    text: Plugin capabilities expose Attest's narrow product shape and do not create a second, surprising workflow beside the CLI and MCP model.
+    review:
+      - List every exposed capability, MCP server entry, hook, and skill.
+      - Explain how each maps to status, review, sign, verify, explain, or install.
+      - Identify any surface that bypasses review-before-signing or duplicates behavior under a confusing name.

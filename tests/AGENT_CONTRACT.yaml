@@ -1,0 +1,30 @@
+version: 1
+module: attest-tests
+claims:
+  - id: attest_tests_protect_product_decisions
+    text: Tests protect user-visible decisions and abstraction boundaries, not just incidental implementation details.
+    review:
+      - List each behavior or boundary whose tests changed.
+      - Explain what product decision the test protects.
+      - Call out any test that mainly verifies private mechanics without increasing product confidence.
+
+  - id: attest_tests_snapshots_read_like_examples
+    text: CLI snapshots read like product examples a maintainer or user could audit, with only volatile values redacted.
+    review:
+      - List every changed snapshot.
+      - Explain what user experience each snapshot preserves.
+      - Confirm redactions do not hide command wording, contract ordering, target binding, or review instructions.
+
+  - id: attest_tests_cover_judgment_boundaries
+    text: Tests cover the boundary cases where a maintainer would argue about whether review is required.
+    review:
+      - List every activation rule changed by this PR.
+      - Name the positive case showing review is required.
+      - Name the nearby negative case showing review is not required.
+
+  - id: attest_tests_fixtures_do_not_define_the_product
+    text: Test fixtures are examples of the product model, not special cases that production code is expected to recognize.
+    review:
+      - List any new fixture paths, claim IDs, symbols, or snapshots.
+      - Explain how production behavior remains generic beyond those fixtures.
+      - Identify any fixture that is too cute, too narrow, or too far from a realistic repository.

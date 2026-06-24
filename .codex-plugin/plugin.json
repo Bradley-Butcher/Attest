@@ -1,0 +1,28 @@
+{
+  "name": "attest",
+  "version": "0.1.0",
+  "description": "PR contract attestations for coding agents, from directories down to functions.",
+  "author": {
+    "name": "Attest maintainers"
+  },
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["agents", "guardrails", "pull-requests", "mcp", "hooks"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Attest",
+    "shortDescription": "Review and sign PR contracts",
+    "longDescription": "Attest helps coding agents review directory and inline contracts, produce evidence-backed PR signoffs, and block stale attestations before code leaves the machine.",
+    "developerName": "Attest maintainers",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write", "Interactive"],
+    "defaultPrompt": [
+      "Use Attest to check PR contract signoffs.",
+      "Create an Attest review worksheet for this PR.",
+      "Explain the inline Attest contracts in this file.",
+      "Verify the Attest PR attestation."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

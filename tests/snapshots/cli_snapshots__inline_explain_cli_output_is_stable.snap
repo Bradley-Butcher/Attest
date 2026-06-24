@@ -1,0 +1,8 @@
+---
+source: tests/cli_snapshots.rs
+expression: output
+---
+crates/engine/src/lib.rs: 1 inline contract(s)
+  - engine.guarded
+      target: function guarded, lines 9-14
+      contract: lines 1-8

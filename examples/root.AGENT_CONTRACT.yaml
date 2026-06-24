@@ -1,0 +1,20 @@
+version: 1
+module: repo
+claims:
+  - id: repo.scope_respected
+    text: I kept the change within the requested scope.
+    review:
+      - List any file changed outside the original task scope.
+      - Explain why each out-of-scope change was necessary.
+
+  - id: repo.tests_not_weakened
+    text: I did not weaken, delete, or bypass tests to make the change pass.
+    review:
+      - List deleted or changed assertions.
+      - Explain why each assertion change preserves coverage.
+
+  - id: repo.public_surface_intentional
+    text: I did not add public API surface unless this change requires it.
+    review:
+      - List any new public item, endpoint, type, command, or config key.
+      - Explain why each public addition belongs in this PR.

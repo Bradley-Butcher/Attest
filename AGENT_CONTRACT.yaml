@@ -1,0 +1,30 @@
+version: 1
+module: attest
+claims:
+  - id: attest.contracts_capture_judgment_not_ci
+    text: Contracts ask the agent to evaluate abstraction, design intent, or product expectations, not to restate deterministic checks.
+    review:
+      - List every new or changed contract claim.
+      - For each claim, name the judgment it asks the agent to make.
+      - Rewrite or remove any claim whose answer could be fully decided by a formatter, linter, unit test, schema validator, or grep.
+
+  - id: attest.abstractions_name_product_concepts
+    text: New names and boundaries describe the product concept they protect, not the incidental implementation mechanism that made the change convenient.
+    review:
+      - List every new command, MCP tool, schema field, target kind, module, type, or persisted file shape.
+      - Explain the user-facing or maintainer-facing concept each name represents.
+      - Call out any name that is temporary, overloaded, too broad, or tied to one implementation detail.
+
+  - id: attest.review_pressure_is_worth_the_cost
+    text: New attestations create useful review pressure at judgment boundaries and do not train agents to rubber-stamp routine changes.
+    review:
+      - List every situation where this change asks for a new signoff.
+      - Explain what bad design, product drift, or abstraction damage the signoff is meant to catch.
+      - Identify any signoff that would fire often without changing a meaningful review decision.
+
+  - id: attest.agent_accountability_is_preserved
+    text: Agent-facing flows make the agent accountable for the truth of each claim rather than optimizing for satisfying a checklist.
+    review:
+      - List every changed prompt, hook message, worksheet field, MCP instruction, or signing path.
+      - Explain how the flow handles false, unsure, stale, missing, or evidence-poor claims.
+      - Remove or revise wording that implies signing is the default next step after a warning.

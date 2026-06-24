@@ -1,0 +1,20 @@
+{
+  "name": "attest-local",
+  "interface": {
+    "displayName": "Attest Local"
+  },
+  "plugins": [
+    {
+      "name": "attest",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
