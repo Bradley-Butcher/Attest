@@ -13,10 +13,19 @@ git add .
 git commit
 ```
 
-The hook blocks and writes:
+The hook blocks with:
 
 ```text
-.git/attest/pending-attestation.yaml
+You need to sign these Attest contracts before committing:
+
+- AGENT_CONTRACT.yaml
+  - repo.design_intentional
+
+Attestation draft written to:
+  .git/attest/pending-attestation.yaml
+
+Follow the instructions at the top of that file, then run:
+  git commit
 ```
 
 The agent follows the instructions at the top of that file, sets every relevant claim to `true`, adds evidence from the staged diff, sets `signed_at`, and retries:
@@ -25,11 +34,11 @@ The agent follows the instructions at the top of that file, sets every relevant 
 git commit
 ```
 
-No PR base. No branch stack logic. Attest signs the staged commit Git is about to create.
+Attest signs the staged commit Git is about to create.
 
 ## Product Shape
 
-- Attest verifies `HEAD -> index`, not a PR, branch, or working tree.
+- Attest verifies the staged diff Git is about to commit.
 - Directory contracts live in the repo as `AGENT_CONTRACT.yaml`.
 - A root contract applies to every staged file in the repo.
 - A nested contract applies to staged files in that subtree.
