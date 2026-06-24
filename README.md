@@ -1,38 +1,55 @@
 # Attest
 
-Attest makes coding agents sign the staged commit before Git creates it.
+Attest is a pre-commit signoff tool for coding agents.
 
-The v0 product is intentionally narrow:
+It blocks a commit until the agent reviews the contracts that apply to the staged diff and fills an evidence-backed attestation. Use it for judgment calls: abstraction boundaries, design taste, product expectations, and other claims a unit test cannot fully decide.
 
-- directory contracts live in the repo as `AGENT_CONTRACT.yaml`
-- contract scope comes from the directory containing that file
-- inline contracts live in source comments next to the code they govern
-- a root contract applies to every staged file in the repo
-- a nested contract applies to staged files in that subtree
-- a function contract applies only when the staged diff touches that function
-- attestations are per staged commit, not per PR or branch
-- the pending attestation lives at `.git/attest/pending-attestation.yaml`
-- inline contract parse results are cached by Git blob under `.git/attest/cache/blobs/`
-- agents must review claim truth and provide evidence before signing
+Attest is not a replacement for CI. Formatters, linters, tests, schema checks, and grep-able rules should stay in normal automation. Attest is for the review pressure you want before an agent creates a commit.
 
-## Install
-
-```sh
-cargo install --path .
-```
-
-During development:
-
-```sh
-cargo run -- status
-```
-
-## Commit Flow
-
-Stage the intended commit:
+## How It Feels
 
 ```sh
 git add .
+git commit
+```
+
+The hook blocks and writes:
+
+```text
+.git/attest/pending-attestation.yaml
+```
+
+The agent follows the instructions at the top of that file, sets every relevant claim to `true`, adds evidence from the staged diff, sets `signed_at`, and retries:
+
+```sh
+git commit
+```
+
+No PR base. No branch stack logic. Attest signs the staged commit Git is about to create.
+
+## Product Shape
+
+- Attest verifies `HEAD -> index`, not a PR, branch, or working tree.
+- Directory contracts live in the repo as `AGENT_CONTRACT.yaml`.
+- A root contract applies to every staged file in the repo.
+- A nested contract applies to staged files in that subtree.
+- Inline contracts live in source comments next to the code they govern.
+- A function contract applies only when the staged diff touches that function.
+- The pending attestation lives under `.git/attest/` and is not committed.
+- The agent must review claim truth and provide evidence before signing.
+- If the staged diff changes, the pending attestation becomes stale.
+
+## Quick Start
+
+```sh
+cargo install --path .
+attest install-hooks
+```
+
+Make a change and try to commit:
+
+```sh
+git add README.md
 git commit
 ```
 
@@ -51,7 +68,33 @@ Follow the instructions at the top of that file, then run:
   git commit
 ```
 
-The generated YAML starts with the required procedure. The agent fills the same file:
+The generated YAML starts with the required procedure:
+
+```yaml
+# Attest commit signoff
+#
+# This file blocks the current git commit until every required claim is reviewed.
+#
+# Required procedure:
+# 1. Inspect the staged diff for this commit.
+# 2. Read each contract and each changed file listed below.
+# 3. For each claim, set status to true only if the claim is actually satisfied.
+# 4. Add concrete evidence from the diff for every true claim.
+# 5. If any claim is false or unsure, do not sign. Report the blocker.
+# 6. Set signed_at after reviewing every claim.
+# 7. Run git commit again.
+```
+
+It also gives the agent the fields to fill:
+
+```yaml
+signoff:
+  agent_kind: codex
+  agent_session: null
+  signed_at: null
+```
+
+After review, the agent fills the same file:
 
 ```yaml
 signoff:
@@ -71,7 +114,7 @@ Then the agent runs `git commit` again. Attest verifies the staged tree, staged 
 
 If the staged diff changes, Attest refreshes the draft. If the same staged diff is still present, Attest leaves the draft alone so existing evidence is not erased.
 
-## Hooks
+## Hook Setup
 
 Install the native Git hook:
 
@@ -112,6 +155,25 @@ repos:
 ```
 
 `prek` uses the same `.pre-commit-config.yaml` shape, so the same hook entry works there too.
+
+## Contract Design
+
+Write contracts for judgment, not automation.
+
+Good Attest claims ask the agent to explain:
+
+- why an abstraction boundary still holds
+- why a new public surface belongs in this change
+- why a behavior is product-correct, not just test-passing
+- why a fixture did not become production policy
+
+Poor Attest claims ask the agent to restate:
+
+- code formatting
+- lint rules
+- unit test results
+- schema validity
+- facts a script can check deterministically
 
 ## Directory Contracts
 

@@ -239,6 +239,36 @@ pub fn other() -> u32 {
     assert_eq!(target.symbol.as_deref(), Some("guarded"));
 }
 
+#[test]
+fn markdown_fenced_inline_examples_do_not_activate_contracts() {
+    let repo = TestRepo::new();
+    repo.write(
+        "README.md",
+        r#"Example:
+
+```rust
+// attest: begin
+// scope: function
+// id: docs.example
+// module: docs
+// claims:
+//   - id: docs.example_reviewed
+//     text: This is documentation, not a live contract.
+// attest: end
+pub fn example() {}
+```
+"#,
+    );
+    repo.stage_all();
+
+    Command::cargo_bin("attest")
+        .unwrap()
+        .args(["status", "--repo", repo.path(), "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("docs.example_reviewed").not());
+}
+
 fn sign_all(attestation: &mut CommitAttestation) {
     attestation.signoff.signed_at = Some(Timestamp::now());
     for item in &mut attestation.items {

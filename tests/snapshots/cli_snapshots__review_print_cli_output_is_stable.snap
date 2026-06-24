@@ -29,6 +29,8 @@ staged_tree: <SHA>
 staged_diff_digest: blake3:<DIGEST>
 signoff:
   agent_kind: codex
+  agent_session: null
+  signed_at: null
 items:
 - contract_path: AGENT_CONTRACT.yaml
   contract_digest: blake3:<DIGEST>
