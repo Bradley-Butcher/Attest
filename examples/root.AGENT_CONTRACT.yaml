@@ -17,4 +17,4 @@ claims:
     text: I did not add public API surface unless this change requires it.
     review:
       - List any new public item, endpoint, type, command, or config key.
-      - Explain why each public addition belongs in this PR.
+      - Explain why each public addition belongs in this staged commit.

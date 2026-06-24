@@ -1,6 +1,0 @@
-{
-  "attest": {
-    "command": "attest",
-    "args": ["mcp-server"]
-  }
-}

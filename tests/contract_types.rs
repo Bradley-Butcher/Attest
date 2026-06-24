@@ -1,11 +1,11 @@
 use assert_cmd::Command;
-use attest_contracts::{ContractTargetKind, ReviewFile};
+use attest_contracts::{AttestationItem, CommitAttestation, ContractTargetKind};
 use camino::Utf8PathBuf;
 use std::process::Command as StdCommand;
 use tempfile::TempDir;
 
 #[test]
-fn parent_folder_contract_applies_to_descendant_change() {
+fn parent_folder_contract_applies_to_descendant_staged_change() {
     let repo = TestRepo::new();
     repo.write(
         "AGENT_CONTRACT.yaml",
@@ -26,17 +26,17 @@ claims:
         "crates/engine/src/lib.rs",
         "pub fn answer() -> u32 { 42 }\n",
     );
-    repo.commit_all("change engine");
+    repo.stage_all();
 
-    let review = repo.review("HEAD~1");
-    let item = only_review_item(&review);
+    let attestation = repo.review();
+    let item = only_attestation_item(&attestation);
     assert_eq!(item.contract_path.as_str(), "AGENT_CONTRACT.yaml");
     assert_eq!(item.claim_id, "repo.parent_reviewed");
     assert_eq!(item.changed_files, vec!["crates/engine/src/lib.rs"]);
 }
 
 #[test]
-fn sub_folder_contract_applies_to_descendant_change() {
+fn sub_folder_contract_applies_to_descendant_staged_change() {
     let repo = TestRepo::new();
     repo.write(
         "crates/engine/AGENT_CONTRACT.yaml",
@@ -57,10 +57,10 @@ claims:
         "crates/engine/src/lib.rs",
         "pub fn answer() -> u32 { 42 }\n",
     );
-    repo.commit_all("change engine");
+    repo.stage_all();
 
-    let review = repo.review("HEAD~1");
-    let item = only_review_item(&review);
+    let attestation = repo.review();
+    let item = only_attestation_item(&attestation);
     assert_eq!(
         item.contract_path.as_str(),
         "crates/engine/AGENT_CONTRACT.yaml"
@@ -70,7 +70,7 @@ claims:
 }
 
 #[test]
-fn inline_script_contract_applies_to_script_change() {
+fn inline_script_contract_applies_to_script_staged_change() {
     let repo = TestRepo::new();
     repo.write(
         "scripts/reconcile.py",
@@ -110,10 +110,10 @@ if __name__ == "__main__":
     main()
 "#,
     );
-    repo.commit_all("change script");
+    repo.stage_all();
 
-    let review = repo.review("HEAD~1");
-    let item = only_review_item(&review);
+    let attestation = repo.review();
+    let item = only_attestation_item(&attestation);
     assert_eq!(
         item.contract_path.as_str(),
         "scripts/reconcile.py#attest:scripts.reconcile"
@@ -125,7 +125,7 @@ if __name__ == "__main__":
 }
 
 #[test]
-fn inline_file_contract_applies_to_file_change() {
+fn inline_file_contract_applies_to_file_staged_change() {
     let repo = TestRepo::new();
     repo.write(
         "docs/release.md",
@@ -157,10 +157,10 @@ Initial release notes.
 Updated release notes.
 "#,
     );
-    repo.commit_all("change docs");
+    repo.stage_all();
 
-    let review = repo.review("HEAD~1");
-    let item = only_review_item(&review);
+    let attestation = repo.review();
+    let item = only_attestation_item(&attestation);
     assert_eq!(
         item.contract_path.as_str(),
         "docs/release.md#attest:docs.release_notes"
@@ -172,7 +172,7 @@ Updated release notes.
 }
 
 #[test]
-fn inline_function_contract_applies_to_function_change() {
+fn inline_function_contract_applies_to_function_staged_change() {
     let repo = TestRepo::new();
     repo.write(
         "src/lib.rs",
@@ -217,10 +217,10 @@ pub fn other() -> u32 {
 }
 "#,
     );
-    repo.commit_all("change guarded");
+    repo.stage_all();
 
-    let review = repo.review("HEAD~1");
-    let item = only_review_item(&review);
+    let attestation = repo.review();
+    let item = only_attestation_item(&attestation);
     assert_eq!(
         item.contract_path.as_str(),
         "src/lib.rs#attest:engine.guarded"
@@ -232,9 +232,9 @@ pub fn other() -> u32 {
     assert_eq!(target.symbol.as_deref(), Some("guarded"));
 }
 
-fn only_review_item(review: &ReviewFile) -> &attest_contracts::ReviewItem {
-    assert_eq!(review.items.len(), 1, "expected one active claim");
-    &review.items[0]
+fn only_attestation_item(attestation: &CommitAttestation) -> &AttestationItem {
+    assert_eq!(attestation.items.len(), 1, "expected one active claim");
+    &attestation.items[0]
 }
 
 struct TestRepo {
@@ -265,20 +265,28 @@ impl TestRepo {
         std::fs::write(path, contents).unwrap();
     }
 
-    fn commit_all(&self, message: &str) {
+    fn stage_all(&self) {
         self.git(["add", "."]);
+    }
+
+    fn commit_all(&self, message: &str) {
+        self.stage_all();
         self.git(["commit", "-m", message]);
     }
 
-    fn review(&self, base: &str) -> ReviewFile {
+    fn review(&self) -> CommitAttestation {
         Command::cargo_bin("attest")
             .unwrap()
-            .args(["review-pr", "--repo", self.path(), "--base", base])
+            .args(["review", "--repo", self.path()])
             .assert()
             .success();
-        let review_path = self.root.join(".git/attest/pr-review.yaml");
-        let review_bytes = std::fs::read(&review_path).unwrap();
-        serde_yaml_ng::from_slice(&review_bytes).unwrap()
+        self.read_attestation()
+    }
+
+    fn read_attestation(&self) -> CommitAttestation {
+        let path = self.root.join(".git/attest/pending-attestation.yaml");
+        let bytes = std::fs::read(path).unwrap();
+        serde_yaml_ng::from_slice(&bytes).unwrap()
     }
 
     fn git<const N: usize>(&self, args: [&str; N]) {

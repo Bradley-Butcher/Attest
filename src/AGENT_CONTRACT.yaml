@@ -2,7 +2,7 @@ version: 1
 module: attest-core
 claims:
   - id: attest_core.model_stays_explainable
-    text: A contributor can explain why each contract became active from PR scope, contract scope, and changed code without reading unrelated subsystems.
+    text: A contributor can explain why each contract became active from the staged commit, contract scope, and changed code without reading unrelated subsystems.
     review:
       - Describe the activation story for directory contracts in one short paragraph.
       - Describe the activation story for inline contracts in one short paragraph.

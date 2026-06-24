@@ -7,7 +7,7 @@ use tempfile::TempDir;
 #[test]
 fn status_cli_output_is_stable() {
     let repo = SnapshotRepo::with_directory_and_inline_contracts();
-    let output = repo.attest_stdout(&["status", "--repo", repo.path(), "--base", "HEAD~1"]);
+    let output = repo.attest_stdout(&["status", "--repo", repo.path()]);
 
     snapshot_settings().bind(|| {
         assert_snapshot!("status_cli_output_is_stable", output);
@@ -17,14 +17,7 @@ fn status_cli_output_is_stable() {
 #[test]
 fn review_print_cli_output_is_stable() {
     let repo = SnapshotRepo::with_directory_and_inline_contracts();
-    let output = repo.attest_stdout(&[
-        "review-pr",
-        "--repo",
-        repo.path(),
-        "--base",
-        "HEAD~1",
-        "--print",
-    ]);
+    let output = repo.attest_stdout(&["review", "--repo", repo.path(), "--print"]);
 
     snapshot_settings().bind(|| {
         assert_snapshot!("review_print_cli_output_is_stable", output);
@@ -49,16 +42,14 @@ fn inline_explain_cli_output_is_stable() {
 
 fn snapshot_settings() -> Settings {
     let mut settings = Settings::clone_current();
-    settings.add_filter(r"/[^ \n]+/\.git/attest/pr-review\.yaml", "<REVIEW_PATH>");
     settings.add_filter(
-        r"at /[^;\n]+/\.git/attest/pr-attestation\.json",
-        "at <ATTESTATION_PATH>",
+        r"/[^ \n]+/\.git/attest/pending-attestation\.yaml",
+        "<ATTESTATION_PATH>",
     );
     settings.add_filter(r"\b[0-9a-f]{40}\b", "<SHA>");
     settings.add_filter(r"\b[0-9a-f]{8}\b", "<SHORT_SHA>");
     settings.add_filter(r"blake3:[0-9a-f]{64}", "blake3:<DIGEST>");
     settings.add_filter(r"generated_at: .+", "generated_at: <TIMESTAMP>");
-    settings.add_filter(r"signed_at: .+", "signed_at: <TIMESTAMP>");
     settings
 }
 
@@ -123,7 +114,7 @@ pub fn guarded(input: u32) -> u32 {
 }
 "#,
         );
-        repo.commit_all("change guarded");
+        repo.stage_all();
         repo
     }
 
@@ -149,8 +140,12 @@ pub fn guarded(input: u32) -> u32 {
         std::fs::write(path, contents).unwrap();
     }
 
-    fn commit_all(&self, message: &str) {
+    fn stage_all(&self) {
         self.git(["add", "."]);
+    }
+
+    fn commit_all(&self, message: &str) {
+        self.stage_all();
         self.git(["commit", "-m", message]);
     }
 

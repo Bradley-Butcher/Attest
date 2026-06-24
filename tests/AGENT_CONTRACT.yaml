@@ -18,7 +18,7 @@ claims:
   - id: attest_tests_cover_judgment_boundaries
     text: Tests cover the boundary cases where a maintainer would argue about whether review is required.
     review:
-      - List every activation rule changed by this PR.
+      - List every activation rule changed by this staged-commit model.
       - Name the positive case showing review is required.
       - Name the nearby negative case showing review is not required.
 

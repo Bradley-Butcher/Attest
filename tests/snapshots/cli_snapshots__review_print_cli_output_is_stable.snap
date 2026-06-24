@@ -1,17 +1,34 @@
 ---
 source: tests/cli_snapshots.rs
+assertion_line: 23
 expression: output
 ---
-Wrote review worksheet to <REVIEW_PATH>
-Review 3 claim(s), set every status to true, and add evidence before signing.
+Wrote attestation draft to <ATTESTATION_PATH>
+Review 3 claim(s), set every status to true, add evidence, set signed_at, then run `git commit` again.
 
-kind: attest.review.v1
+# Attest commit signoff
+#
+# This file blocks the current git commit until every required claim is reviewed.
+#
+# Required procedure:
+# 1. Inspect the staged diff for this commit.
+# 2. Read each contract and each changed file listed below.
+# 3. For each claim, set status to true only if the claim is actually satisfied.
+# 4. Add concrete evidence from the diff for every true claim.
+# 5. If any claim is false or unsure, do not sign. Report the blocker.
+# 6. Set signed_at after reviewing every claim.
+# 7. Run git commit again.
+#
+# Do not sign mechanically. This is not a checklist to rubber-stamp.
+
+kind: attest.commit.v1
 generated_at: <TIMESTAMP>
-base_ref: HEAD~1
+base: HEAD
 base_sha: <SHA>
-merge_base_sha: <SHA>
-head_sha: <SHA>
-diff_digest: blake3:<DIGEST>
+staged_tree: <SHA>
+staged_diff_digest: blake3:<DIGEST>
+signoff:
+  agent_kind: codex
 items:
 - contract_path: AGENT_CONTRACT.yaml
   contract_digest: blake3:<DIGEST>

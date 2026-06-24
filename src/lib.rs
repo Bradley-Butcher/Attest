@@ -1,19 +1,11 @@
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use git2::{DiffFormat, DiffOptions, Oid, Repository, StatusOptions};
-use inquire::{Select, Text};
+use git2::{DiffFormat, DiffOptions, ObjectType, Oid, Repository, StatusOptions, Tree};
 use jiff::Timestamp;
-use rmcp::{
-    Json, ServerHandler, ServiceExt,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router,
-};
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::IsTerminal;
 use std::path::Path;
 use tree_sitter::{Language, Node, Parser as TsParser};
 
@@ -25,16 +17,16 @@ const CONTRACT_FILENAMES: &[&str] = &[
 ];
 
 const ATTEST_DIR: &str = "attest";
-const ATTESTATION_FILE: &str = "pr-attestation.json";
-const REVIEW_FILE: &str = "pr-review.yaml";
+const ATTESTATION_FILE: &str = "pending-attestation.yaml";
 const INLINE_CACHE_VERSION: &str = "attest.inline-cache.v1";
 const INLINE_BEGIN: &[u8] = b"attest: begin";
+const COMMIT_ATTESTATION_KIND: &str = "attest.commit.v1";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "attest",
     version,
-    about = "Per-PR contract attestations for coding agents"
+    about = "Staged commit contract attestations for coding agents"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -45,24 +37,20 @@ pub struct Cli {
 enum Command {
     /// Create a starter AGENT_CONTRACT.yaml.
     Init(InitArgs),
-    /// Show required contracts for the current PR diff.
+    /// Show required contracts for the staged commit.
     Status(StatusArgs),
-    /// Generate a review worksheet the agent must fill before signing.
-    ReviewPr(ReviewArgs),
-    /// Sign the current PR diff after reviewing every active claim.
-    SignPr(SignArgs),
-    /// Verify the current PR attestation is fresh and complete.
-    VerifyPr(VerifyArgs),
-    /// Codex Stop hook entrypoint. Emits hook JSON.
-    CodexStopHook(HookArgs),
-    /// Install Codex and/or Git hooks for this repository.
+    /// Create or refresh the pending commit attestation draft.
+    Review(ReviewArgs),
+    /// Verify the pending commit attestation draft.
+    Verify(VerifyArgs),
+    /// Git pre-commit hook entrypoint.
+    PreCommitHook(HookArgs),
+    /// Install the Git pre-commit hook for this repository.
     InstallHooks(InstallHookArgs),
     /// Inspect inline comment contracts in source files.
     Inline(InlineArgs),
-    /// Emit JSON schema for contract, review, or attestation files.
+    /// Emit JSON schema for contract or attestation files.
     Schema(SchemaArgs),
-    /// Run Attest as a stdio MCP server.
-    McpServer,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -70,16 +58,6 @@ struct RepoArgs {
     /// Repository path. Defaults to the current directory.
     #[arg(long)]
     repo: Option<Utf8PathBuf>,
-}
-
-#[derive(Debug, Args, Clone)]
-struct PrArgs {
-    #[command(flatten)]
-    repo: RepoArgs,
-
-    /// Base branch/ref for the PR diff.
-    #[arg(long, default_value = "origin/main", env = "ATTEST_BASE")]
-    base: String,
 }
 
 #[derive(Debug, Args)]
@@ -95,7 +73,7 @@ struct InitArgs {
 #[derive(Debug, Args)]
 struct StatusArgs {
     #[command(flatten)]
-    pr: PrArgs,
+    repo: RepoArgs,
 
     /// Print machine-readable JSON.
     #[arg(long)]
@@ -105,45 +83,35 @@ struct StatusArgs {
 #[derive(Debug, Args)]
 struct ReviewArgs {
     #[command(flatten)]
-    pr: PrArgs,
+    repo: RepoArgs,
 
-    /// Review worksheet path. Defaults to .git/attest/pr-review.yaml.
+    /// Attestation draft path. Defaults to .git/attest/pending-attestation.yaml.
     #[arg(long)]
     output: Option<Utf8PathBuf>,
 
-    /// Also print the generated review worksheet.
+    /// Overwrite an existing draft even when it matches the staged diff.
+    #[arg(long)]
+    force: bool,
+
+    /// Also print the generated attestation draft.
     #[arg(long)]
     print: bool,
-}
 
-#[derive(Debug, Args)]
-struct SignArgs {
-    #[command(flatten)]
-    pr: PrArgs,
-
-    /// Read reviewed answers from a worksheet. Defaults to .git/attest/pr-review.yaml when present.
-    #[arg(long)]
-    from_review: Option<Option<Utf8PathBuf>>,
-
-    /// Agent kind recorded in the attestation.
+    /// Agent kind recorded in the draft.
     #[arg(long, default_value = "codex", env = "ATTEST_AGENT_KIND")]
     agent_kind: String,
 
-    /// Agent/session identifier recorded in the attestation.
+    /// Agent/session identifier recorded in the draft.
     #[arg(long, env = "ATTEST_AGENT_SESSION")]
     session_id: Option<String>,
-
-    /// Attestation output path. Defaults to .git/attest/pr-attestation.json.
-    #[arg(long)]
-    output: Option<Utf8PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct VerifyArgs {
     #[command(flatten)]
-    pr: PrArgs,
+    repo: RepoArgs,
 
-    /// Attestation path. Defaults to .git/attest/pr-attestation.json.
+    /// Attestation draft path. Defaults to .git/attest/pending-attestation.yaml.
     #[arg(long)]
     attestation: Option<Utf8PathBuf>,
 
@@ -155,27 +123,23 @@ struct VerifyArgs {
 #[derive(Debug, Args)]
 struct HookArgs {
     #[command(flatten)]
-    pr: PrArgs,
+    repo: RepoArgs,
 
-    /// Treat repository/base setup errors as no-op. Useful for globally enabled plugin hooks.
-    #[arg(long)]
-    soft: bool,
+    /// Agent kind recorded when the hook creates a draft.
+    #[arg(long, default_value = "codex", env = "ATTEST_AGENT_KIND")]
+    agent_kind: String,
+
+    /// Agent/session identifier recorded when the hook creates a draft.
+    #[arg(long, env = "ATTEST_AGENT_SESSION")]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct InstallHookArgs {
     #[command(flatten)]
-    pr: PrArgs,
+    repo: RepoArgs,
 
-    /// Install the Codex Stop hook in .codex/hooks.json.
-    #[arg(long)]
-    codex: bool,
-
-    /// Install the Git pre-push hook in .git/hooks/pre-push.
-    #[arg(long)]
-    git: bool,
-
-    /// Overwrite existing hook files.
+    /// Overwrite an existing pre-commit hook.
     #[arg(long)]
     force: bool,
 }
@@ -216,7 +180,6 @@ struct SchemaArgs {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SchemaKind {
     Contract,
-    Review,
     Attestation,
 }
 
@@ -224,18 +187,12 @@ pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init(args) => init(args),
         Command::Status(args) => status(args),
-        Command::ReviewPr(args) => review_pr(args),
-        Command::SignPr(args) => sign_pr(args),
-        Command::VerifyPr(args) => verify_pr(args),
-        Command::CodexStopHook(args) => codex_stop_hook(args),
+        Command::Review(args) => review(args),
+        Command::Verify(args) => verify(args),
+        Command::PreCommitHook(args) => pre_commit_hook(args),
         Command::InstallHooks(args) => install_hooks(args),
         Command::Inline(args) => inline(args),
         Command::Schema(args) => schema(args),
-        Command::McpServer => {
-            let runtime =
-                tokio::runtime::Runtime::new().context("failed to start tokio runtime")?;
-            runtime.block_on(run_mcp_server())
-        }
     }
 }
 
@@ -313,35 +270,44 @@ pub enum ContractTargetKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct PrState {
-    pub base_ref: String,
-    pub base_sha: String,
-    pub merge_base_sha: String,
-    pub head_sha: String,
-    pub diff_digest: String,
+pub struct CommitState {
+    pub base: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
+    pub staged_tree: String,
+    pub staged_diff_digest: String,
     pub changed_files: Vec<String>,
-    pub dirty_files: Vec<String>,
+    pub unstaged_files: Vec<String>,
     pub active_contracts: Vec<ActiveContract>,
     #[schemars(with = "String")]
     pub attestation_path: Utf8PathBuf,
-    #[schemars(with = "String")]
-    pub review_path: Utf8PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ReviewFile {
+pub struct CommitAttestation {
     pub kind: String,
     pub generated_at: String,
-    pub base_ref: String,
-    pub base_sha: String,
-    pub merge_base_sha: String,
-    pub head_sha: String,
-    pub diff_digest: String,
-    pub items: Vec<ReviewItem>,
+    pub base: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
+    pub staged_tree: String,
+    pub staged_diff_digest: String,
+    pub signoff: AttestationSignoff,
+    pub items: Vec<AttestationItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ReviewItem {
+pub struct AttestationSignoff {
+    #[serde(default = "default_agent_kind")]
+    pub agent_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_at: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AttestationItem {
     #[schemars(with = "String")]
     pub contract_path: Utf8PathBuf,
     pub contract_digest: String,
@@ -375,46 +341,6 @@ pub enum ClaimStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct Attestation {
-    pub kind: String,
-    pub signed_at: String,
-    pub base_ref: String,
-    pub base_sha: String,
-    pub merge_base_sha: String,
-    pub head_sha: String,
-    pub diff_digest: String,
-    pub agent: Agent,
-    pub contracts: Vec<ContractSignoff>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct Agent {
-    pub kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ContractSignoff {
-    #[schemars(with = "String")]
-    pub path: Utf8PathBuf,
-    pub digest: String,
-    pub module: String,
-    #[serde(default)]
-    pub source: ContractSource,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<ContractTarget>,
-    pub claims: Vec<ClaimSignoff>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ClaimSignoff {
-    pub id: String,
-    pub status: ClaimStatus,
-    pub evidence: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VerifyReport {
     pub verdict: Verdict,
     pub blockers: Vec<String>,
@@ -435,8 +361,10 @@ pub enum Verdict {
 pub struct AttestationSummary {
     #[schemars(with = "String")]
     pub path: Utf8PathBuf,
-    pub signed_at: String,
-    pub agent: Agent,
+    pub signed_at: Timestamp,
+    pub agent_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<String>,
 }
 
 struct RepoContext {
@@ -475,10 +403,6 @@ impl RepoContext {
         self.attest_dir().join(ATTESTATION_FILE)
     }
 
-    fn review_path(&self) -> Utf8PathBuf {
-        self.attest_dir().join(REVIEW_FILE)
-    }
-
     fn inline_cache_dir(&self) -> Utf8PathBuf {
         self.attest_dir().join("cache").join("blobs")
     }
@@ -512,23 +436,22 @@ fn sample_contract() -> &'static str {
     r#"version: 1
 module: repo
 claims:
-  - id: repo.no_test_case_heuristics
-    text: I did not add logic specific to a single test fixture.
+  - id: repo.abstraction_boundary_preserved
+    text: I preserved the abstraction boundaries this change touches.
     review:
-      - List each production branch added or changed.
-      - Explain why each branch generalizes beyond the regression test.
-      - Name the test or check that would fail if the logic were hard-coded.
-  - id: repo.public_surface_intentional
-    text: I did not add public API surface unless this change requires it.
+      - Name each boundary touched by the staged diff.
+      - Explain why the behavior belongs behind that boundary.
+      - Call out any shortcut that would make the code harder to reason about later.
+  - id: repo.product_expectation_preserved
+    text: I preserved the product expectation this code is responsible for.
     review:
-      - List any new public item, endpoint, type, or command.
-      - Explain why each public addition belongs in this change.
+      - State the product expectation in one sentence.
+      - Explain how the staged diff keeps that expectation true.
 "#
 }
 
 fn status(args: StatusArgs) -> Result<()> {
-    let ctx = RepoContext::open(&args.pr.repo.repo)?;
-    let state = build_pr_state(&ctx, &args.pr.base)?;
+    let (ctx, state) = commit_state_from_args(&args.repo)?;
     let report = verify_state(&ctx, &state, None)?;
 
     if args.json {
@@ -541,80 +464,45 @@ fn status(args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
-fn review_pr(args: ReviewArgs) -> Result<()> {
-    let ctx = RepoContext::open(&args.pr.repo.repo)?;
-    let state = build_pr_state(&ctx, &args.pr.base)?;
-    let review = review_template(&state);
-    let output = args.output.unwrap_or_else(|| ctx.review_path());
+fn review(args: ReviewArgs) -> Result<()> {
+    let (ctx, state) = commit_state_from_args(&args.repo)?;
+    let output = args.output.unwrap_or_else(|| ctx.attestation_path());
+    let action = ensure_draft_for_state(
+        &ctx,
+        &state,
+        &output,
+        &args.agent_kind,
+        args.session_id.clone(),
+        args.force,
+    )?;
 
-    ctx.ensure_attest_dir()?;
-    let yaml = serde_yaml_ng::to_string(&review).context("failed to serialize review worksheet")?;
-    fs_err::write(&output, &yaml).with_context(|| format!("failed to write {output}"))?;
-
-    println!("Wrote review worksheet to {output}");
+    match action {
+        DraftAction::Created => println!("Wrote attestation draft to {output}"),
+        DraftAction::Replaced => println!("Refreshed stale attestation draft at {output}"),
+        DraftAction::Kept => println!("Kept current attestation draft at {output}"),
+    }
     if state.active_contracts.is_empty() {
-        println!("No contracts apply to the current PR diff.");
+        println!("No contracts apply to the staged commit.");
     } else {
         println!(
-            "Review {} claim(s), set every status to true, and add evidence before signing.",
-            review.items.len()
+            "Review {} claim(s), set every status to true, add evidence, set signed_at, then run `git commit` again.",
+            state
+                .active_contracts
+                .iter()
+                .map(|contract| contract.claims.len())
+                .sum::<usize>()
         );
     }
     if args.print {
-        println!("\n{yaml}");
+        let bytes =
+            fs_err::read(&output).with_context(|| format!("failed to read draft {output}"))?;
+        println!("\n{}", String::from_utf8_lossy(&bytes));
     }
     Ok(())
 }
 
-fn sign_pr(args: SignArgs) -> Result<()> {
-    let ctx = RepoContext::open(&args.pr.repo.repo)?;
-    let state = build_pr_state(&ctx, &args.pr.base)?;
-    let review_path = match args.from_review {
-        Some(Some(path)) => Some(path),
-        Some(None) => Some(ctx.review_path()),
-        None if ctx.review_path().exists() => Some(ctx.review_path()),
-        None => None,
-    };
-
-    let signoffs = if let Some(path) = review_path {
-        let review = read_review(&path)?;
-        signoffs_from_review(&state, &review)?
-    } else {
-        if !std::io::stdin().is_terminal() {
-            bail!(
-                "non-interactive signing requires a review worksheet. Run `attest review-pr --base {}` first.",
-                args.pr.base
-            );
-        }
-        prompt_for_signoffs(&state)?
-    };
-
-    let attestation = Attestation {
-        kind: "attest.pr.v1".to_string(),
-        signed_at: Timestamp::now().to_string(),
-        base_ref: state.base_ref.clone(),
-        base_sha: state.base_sha.clone(),
-        merge_base_sha: state.merge_base_sha.clone(),
-        head_sha: state.head_sha.clone(),
-        diff_digest: state.diff_digest.clone(),
-        agent: Agent {
-            kind: args.agent_kind,
-            session_id: args.session_id,
-        },
-        contracts: signoffs,
-    };
-
-    let output = args.output.unwrap_or_else(|| ctx.attestation_path());
-    ctx.ensure_attest_dir()?;
-    fs_err::write(&output, serde_json::to_string_pretty(&attestation)?)
-        .with_context(|| format!("failed to write {output}"))?;
-    println!("Signed PR attestation at {output}");
-    Ok(())
-}
-
-fn verify_pr(args: VerifyArgs) -> Result<()> {
-    let ctx = RepoContext::open(&args.pr.repo.repo)?;
-    let state = build_pr_state(&ctx, &args.pr.base)?;
+fn verify(args: VerifyArgs) -> Result<()> {
+    let (ctx, state) = commit_state_from_args(&args.repo)?;
     let report = verify_state(&ctx, &state, args.attestation.as_ref())?;
 
     if args.json {
@@ -624,75 +512,39 @@ fn verify_pr(args: VerifyArgs) -> Result<()> {
     }
 
     if report.verdict == Verdict::Blocked {
-        bail!("PR attestation verification failed");
+        bail!("commit attestation verification failed");
     }
     Ok(())
 }
 
-fn codex_stop_hook(args: HookArgs) -> Result<()> {
-    let ctx = match RepoContext::open(&args.pr.repo.repo) {
-        Ok(ctx) => ctx,
-        Err(error) if args.soft => {
-            eprintln!("Attest soft hook skipped: {error}");
-            println!("{{}}");
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
-    let state = match build_pr_state(&ctx, &args.pr.base) {
-        Ok(state) => state,
-        Err(error) if args.soft => {
-            eprintln!("Attest soft hook skipped: {error}");
-            println!("{{}}");
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
-    let report = verify_state(&ctx, &state, None)?;
-
-    let mut reasons = Vec::new();
-    if !state.dirty_files.is_empty() {
-        reasons.push(format!(
-            "The working tree has uncommitted changes: {}. Attest signs the committed PR diff, so commit or stash those changes before signing.",
-            state.dirty_files.join(", ")
-        ));
-    }
-    reasons.extend(report.blockers.clone());
-
-    if reasons.is_empty() {
-        println!("{{}}");
+fn pre_commit_hook(args: HookArgs) -> Result<()> {
+    let (ctx, state) = commit_state_from_args(&args.repo)?;
+    if state.active_contracts.is_empty() {
         return Ok(());
     }
 
-    let reason = format!(
-        "{}\n\nDo not sign mechanically. Run `attest status --base {base}` and `attest review-pr --base {base}`. Inspect each changed module contract and matching diff. If any claim is false or uncertain, fix the code or report the blocker. Only after every required claim is true, fill the review worksheet, run `attest sign-pr --base {base} --from-review`, then run `attest verify-pr --base {base}`.",
-        reasons.join("\n"),
-        base = args.pr.base
-    );
-    let payload = serde_json::json!({
-        "continue": false,
-        "stopReason": "Attest PR signoff is stale",
-        "systemMessage": reason
-    });
-    println!("{}", serde_json::to_string_pretty(&payload)?);
-    Ok(())
+    let path = ctx.attestation_path();
+    let action = ensure_draft_for_state(
+        &ctx,
+        &state,
+        &path,
+        &args.agent_kind,
+        args.session_id.clone(),
+        false,
+    )?;
+    let report = verify_state(&ctx, &state, Some(&path))?;
+    if report.verdict == Verdict::Accepted {
+        return Ok(());
+    }
+
+    eprintln!("{}", pre_commit_block_message(&ctx, &state, &path, action));
+    std::process::exit(1);
 }
 
 fn install_hooks(args: InstallHookArgs) -> Result<()> {
-    let ctx = RepoContext::open(&args.pr.repo.repo)?;
-    let install_codex = args.codex || !args.git;
-    let install_git = args.git || !args.codex;
-
-    if install_codex {
-        let hooks_path = write_codex_hook(&ctx, &args.pr.base, args.force)?;
-        println!("Installed Codex Stop hook at {hooks_path}");
-    }
-
-    if install_git {
-        let hook_path = write_git_hook(&ctx, &args.pr.base, args.force)?;
-        println!("Installed Git pre-push hook at {hook_path}");
-    }
-
+    let ctx = RepoContext::open(&args.repo.repo)?;
+    let hook_path = write_pre_commit_hook(&ctx, args.force)?;
+    println!("Installed Git pre-commit hook at {hook_path}");
     Ok(())
 }
 
@@ -769,43 +621,12 @@ fn repo_relative_path(ctx: &RepoContext, path: &Utf8Path) -> Result<Utf8PathBuf>
     Ok(path.to_path_buf())
 }
 
-fn write_codex_hook(ctx: &RepoContext, base: &str, force: bool) -> Result<Utf8PathBuf> {
-    let codex_dir = ctx.root.join(".codex");
-    fs_err::create_dir_all(&codex_dir).with_context(|| format!("failed to create {codex_dir}"))?;
-    let hooks_path = codex_dir.join("hooks.json");
-    if hooks_path.exists() && !force {
-        bail!("{hooks_path} already exists. Re-run with --force to overwrite it.");
-    }
-    let hook = serde_json::json!({
-        "hooks": {
-            "Stop": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": format!("attest codex-stop-hook --base {}", shell_quote(base)),
-                            "timeout": 30,
-                            "statusMessage": "Checking Attest PR signoff"
-                        }
-                    ]
-                }
-            ]
-        }
-    });
-    fs_err::write(&hooks_path, serde_json::to_string_pretty(&hook)?)
-        .with_context(|| format!("failed to write {hooks_path}"))?;
-    Ok(hooks_path)
-}
-
-fn write_git_hook(ctx: &RepoContext, base: &str, force: bool) -> Result<Utf8PathBuf> {
-    let hook_path = ctx.git_dir.join("hooks").join("pre-push");
+fn write_pre_commit_hook(ctx: &RepoContext, force: bool) -> Result<Utf8PathBuf> {
+    let hook_path = ctx.git_dir.join("hooks").join("pre-commit");
     if hook_path.exists() && !force {
         bail!("{hook_path} already exists. Re-run with --force to overwrite it.");
     }
-    let hook = format!(
-        "#!/bin/sh\nset -eu\nattest verify-pr --base {}\n",
-        shell_quote(base)
-    );
+    let hook = "#!/bin/sh\nset -eu\nattest pre-commit-hook\n";
     fs_err::write(&hook_path, hook).with_context(|| format!("failed to write {hook_path}"))?;
     make_executable(&hook_path)?;
     Ok(hook_path)
@@ -814,469 +635,61 @@ fn write_git_hook(ctx: &RepoContext, base: &str, force: bool) -> Result<Utf8Path
 fn schema(args: SchemaArgs) -> Result<()> {
     let value = match args.kind {
         SchemaKind::Contract => serde_json::to_value(schema_for!(Contract))?,
-        SchemaKind::Review => serde_json::to_value(schema_for!(ReviewFile))?,
-        SchemaKind::Attestation => serde_json::to_value(schema_for!(Attestation))?,
+        SchemaKind::Attestation => serde_json::to_value(schema_for!(CommitAttestation))?,
     };
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 
-async fn run_mcp_server() -> Result<()> {
-    AttestMcpServer::new()
-        .serve(rmcp::transport::stdio())
-        .await
-        .context("failed to start Attest MCP server")?
-        .waiting()
-        .await
-        .context("Attest MCP server failed")?;
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct AttestMcpServer {
-    tool_router: ToolRouter<Self>,
-}
-
-impl AttestMcpServer {
-    fn new() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct McpPrParams {
-    #[schemars(description = "Repository path. Defaults to the current working directory.")]
-    repo: Option<String>,
-    #[schemars(description = "PR base ref. Defaults to origin/main.")]
-    base: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct McpReviewParams {
-    #[schemars(description = "Repository path. Defaults to the current working directory.")]
-    repo: Option<String>,
-    #[schemars(description = "PR base ref. Defaults to origin/main.")]
-    base: Option<String>,
-    #[schemars(description = "Optional output path. Defaults to .git/attest/pr-review.yaml.")]
-    output: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct McpSignParams {
-    #[schemars(description = "Repository path. Defaults to the current working directory.")]
-    repo: Option<String>,
-    #[schemars(description = "PR base ref. Defaults to origin/main.")]
-    base: Option<String>,
-    #[schemars(description = "Agent kind recorded in the attestation. Defaults to codex.")]
-    agent_kind: Option<String>,
-    #[schemars(description = "Agent/session identifier recorded in the attestation.")]
-    session_id: Option<String>,
-    #[schemars(
-        description = "Reviewed claim answers. Every active claim must be true with evidence."
-    )]
-    claims: Vec<McpClaimReview>,
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct McpClaimReview {
-    #[schemars(
-        description = "Contract path, for example AGENT_CONTRACT.yaml or crates/engine/AGENT_CONTRACT.yaml."
-    )]
-    contract_path: String,
-    #[schemars(description = "Claim id from the contract.")]
-    claim_id: String,
-    #[schemars(description = "Must be true to sign. false and unsure are rejected.")]
-    status: ClaimStatus,
-    #[schemars(description = "Evidence from reviewing the diff. Required by default.")]
-    evidence: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct McpInitParams {
-    #[schemars(description = "Repository path. Defaults to the current working directory.")]
-    repo: Option<String>,
-    #[schemars(description = "Overwrite an existing root AGENT_CONTRACT.yaml.")]
-    force: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct McpInstallHooksParams {
-    #[schemars(description = "Repository path. Defaults to the current working directory.")]
-    repo: Option<String>,
-    #[schemars(description = "PR base ref. Defaults to origin/main.")]
-    base: Option<String>,
-    #[schemars(
-        description = "Install the Codex Stop hook. If neither hook flag is true, both are installed."
-    )]
-    codex: Option<bool>,
-    #[schemars(
-        description = "Install the Git pre-push hook. If neither hook flag is true, both are installed."
-    )]
-    git: Option<bool>,
-    #[schemars(description = "Overwrite existing hook files.")]
-    force: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct McpInlineExplainParams {
-    #[schemars(description = "Repository path. Defaults to the current working directory.")]
-    repo: Option<String>,
-    #[schemars(description = "Source file path, relative to the repository root.")]
-    path: String,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-struct McpStatusOutput {
-    state: PrState,
-    verification: VerifyReport,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-struct McpReviewOutput {
-    path: String,
-    review: ReviewFile,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-struct McpSignOutput {
-    path: String,
-    attestation: Attestation,
-    verification: VerifyReport,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-struct McpPathOutput {
-    path: String,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-struct McpInstallHooksOutput {
-    codex_hook: Option<String>,
-    git_hook: Option<String>,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-struct McpInlineExplainOutput {
-    path: String,
-    contracts: Vec<McpInlineExplainContract>,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-struct McpInlineExplainContract {
-    id: String,
-    module: String,
-    target: ContractTarget,
-    claims: Vec<Claim>,
-}
-
-#[tool_router]
-impl AttestMcpServer {
-    #[tool(
-        name = "status_pr",
-        description = "Inspect the current PR diff, active directory/inline contracts, and attestation freshness."
-    )]
-    fn status_pr(
-        &self,
-        Parameters(params): Parameters<McpPrParams>,
-    ) -> Result<Json<McpStatusOutput>, String> {
-        let (ctx, state) = mcp_state(params.repo, params.base)?;
-        let verification = verify_state(&ctx, &state, None).map_err(tool_error)?;
-        Ok(Json(McpStatusOutput {
-            state,
-            verification,
-        }))
-    }
-
-    #[tool(
-        name = "create_review",
-        description = "Create a PR review worksheet with every active contract claim that must be reviewed before signing."
-    )]
-    fn create_review(
-        &self,
-        Parameters(params): Parameters<McpReviewParams>,
-    ) -> Result<Json<McpReviewOutput>, String> {
-        let (ctx, state) = mcp_state(params.repo, params.base)?;
-        let review = review_template(&state);
-        let output = match params.output {
-            Some(path) => Utf8PathBuf::from(path),
-            None => ctx.review_path(),
-        };
-
-        ctx.ensure_attest_dir().map_err(tool_error)?;
-        let yaml = serde_yaml_ng::to_string(&review).map_err(tool_error)?;
-        fs_err::write(&output, yaml).map_err(tool_error)?;
-
-        Ok(Json(McpReviewOutput {
-            path: output.to_string(),
-            review,
-        }))
-    }
-
-    #[tool(
-        name = "sign_pr",
-        description = "Sign the current PR attestation from reviewed claim answers. Rejects false, unsure, missing, or evidence-free claims."
-    )]
-    fn sign_pr_tool(
-        &self,
-        Parameters(params): Parameters<McpSignParams>,
-    ) -> Result<Json<McpSignOutput>, String> {
-        let (ctx, state) = mcp_state(params.repo, params.base)?;
-        let mut review = review_template(&state);
-        apply_mcp_claim_reviews(&mut review, params.claims)?;
-        let signoffs = signoffs_from_review(&state, &review).map_err(tool_error)?;
-
-        let attestation = Attestation {
-            kind: "attest.pr.v1".to_string(),
-            signed_at: Timestamp::now().to_string(),
-            base_ref: state.base_ref.clone(),
-            base_sha: state.base_sha.clone(),
-            merge_base_sha: state.merge_base_sha.clone(),
-            head_sha: state.head_sha.clone(),
-            diff_digest: state.diff_digest.clone(),
-            agent: Agent {
-                kind: params.agent_kind.unwrap_or_else(|| "codex".to_string()),
-                session_id: params.session_id,
-            },
-            contracts: signoffs,
-        };
-
-        let output = ctx.attestation_path();
-        ctx.ensure_attest_dir().map_err(tool_error)?;
-        fs_err::write(
-            &output,
-            serde_json::to_string_pretty(&attestation).map_err(tool_error)?,
-        )
-        .map_err(tool_error)?;
-        let verification = verify_state(&ctx, &state, None).map_err(tool_error)?;
-
-        Ok(Json(McpSignOutput {
-            path: output.to_string(),
-            attestation,
-            verification,
-        }))
-    }
-
-    #[tool(
-        name = "verify_pr",
-        description = "Verify that the current PR attestation is fresh and complete."
-    )]
-    fn verify_pr_tool(
-        &self,
-        Parameters(params): Parameters<McpPrParams>,
-    ) -> Result<Json<VerifyReport>, String> {
-        let (ctx, state) = mcp_state(params.repo, params.base)?;
-        verify_state(&ctx, &state, None)
-            .map(Json)
-            .map_err(tool_error)
-    }
-
-    #[tool(
-        name = "init_contract",
-        description = "Create a starter root AGENT_CONTRACT.yaml."
-    )]
-    fn init_contract(
-        &self,
-        Parameters(params): Parameters<McpInitParams>,
-    ) -> Result<Json<McpPathOutput>, String> {
-        let repo = repo_arg(params.repo)?;
-        let ctx = RepoContext::open(&repo).map_err(tool_error)?;
-        let path = ctx.root.join("AGENT_CONTRACT.yaml");
-        if path.exists() && !params.force.unwrap_or(false) {
-            return Err(format!(
-                "{path} already exists. Re-run with force=true to overwrite it."
-            ));
-        }
-        fs_err::write(&path, sample_contract()).map_err(tool_error)?;
-        Ok(Json(McpPathOutput {
-            path: path.to_string(),
-        }))
-    }
-
-    #[tool(
-        name = "install_hooks",
-        description = "Install Attest Codex Stop and/or Git pre-push hooks for this repository."
-    )]
-    fn install_hooks_tool(
-        &self,
-        Parameters(params): Parameters<McpInstallHooksParams>,
-    ) -> Result<Json<McpInstallHooksOutput>, String> {
-        let repo = repo_arg(params.repo)?;
-        let ctx = RepoContext::open(&repo).map_err(tool_error)?;
-        let codex = params.codex.unwrap_or(false);
-        let git = params.git.unwrap_or(false);
-        let install_codex = codex || !git;
-        let install_git = git || !codex;
-        let base = params.base.unwrap_or_else(default_base);
-        let force = params.force.unwrap_or(false);
-
-        let codex_hook = if install_codex {
-            Some(
-                write_codex_hook(&ctx, &base, force)
-                    .map_err(tool_error)?
-                    .to_string(),
-            )
-        } else {
-            None
-        };
-        let git_hook = if install_git {
-            Some(
-                write_git_hook(&ctx, &base, force)
-                    .map_err(tool_error)?
-                    .to_string(),
-            )
-        } else {
-            None
-        };
-
-        Ok(Json(McpInstallHooksOutput {
-            codex_hook,
-            git_hook,
-        }))
-    }
-
-    #[tool(
-        name = "explain_inline",
-        description = "Validate inline contracts in a source file and return the file/function bindings."
-    )]
-    fn explain_inline(
-        &self,
-        Parameters(params): Parameters<McpInlineExplainParams>,
-    ) -> Result<Json<McpInlineExplainOutput>, String> {
-        let repo = repo_arg(params.repo)?;
-        let ctx = RepoContext::open(&repo).map_err(tool_error)?;
-        let relative =
-            repo_relative_path(&ctx, &Utf8PathBuf::from(params.path)).map_err(tool_error)?;
-        let contracts = inline_contracts_from_worktree(&ctx, &relative).map_err(tool_error)?;
-        let contracts = contracts
-            .into_iter()
-            .map(|contract| {
-                let target = ContractTarget {
-                    kind: contract.scope.target_kind(),
-                    path: relative.to_string(),
-                    symbol: contract.symbol.clone(),
-                    start_line: contract.target_span.start_line,
-                    end_line: contract.target_span.end_line,
-                    contract_start_line: contract.comment_span.start_line,
-                    contract_end_line: contract.comment_span.end_line,
-                };
-                McpInlineExplainContract {
-                    id: contract.id,
-                    module: contract.module,
-                    target,
-                    claims: contract.claims,
-                }
-            })
-            .collect();
-        Ok(Json(McpInlineExplainOutput {
-            path: relative.to_string(),
-            contracts,
-        }))
-    }
-}
-
-#[tool_handler(router = self.tool_router)]
-impl ServerHandler for AttestMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Attest enforces directory and inline PR contract signoffs. Use status_pr first. Before calling sign_pr, inspect the diff and only mark claims true when they are actually true and supported by evidence.",
-        )
-    }
-}
-
-fn mcp_state(repo: Option<String>, base: Option<String>) -> Result<(RepoContext, PrState), String> {
-    let repo = repo_arg(repo)?;
-    let ctx = RepoContext::open(&repo).map_err(tool_error)?;
-    let state = build_pr_state(&ctx, &base.unwrap_or_else(default_base)).map_err(tool_error)?;
+fn commit_state_from_args(args: &RepoArgs) -> Result<(RepoContext, CommitState)> {
+    let ctx = RepoContext::open(&args.repo)?;
+    let state = build_commit_state(&ctx)?;
     Ok((ctx, state))
-}
-
-fn repo_arg(repo: Option<String>) -> Result<Option<Utf8PathBuf>, String> {
-    Ok(repo.map(Utf8PathBuf::from))
-}
-
-fn default_base() -> String {
-    "origin/main".to_string()
-}
-
-fn apply_mcp_claim_reviews(
-    review: &mut ReviewFile,
-    claims: Vec<McpClaimReview>,
-) -> Result<(), String> {
-    let expected = review
-        .items
-        .iter()
-        .map(|item| (item.contract_path.to_string(), item.claim_id.clone()))
-        .collect::<BTreeSet<_>>();
-    let mut provided = BTreeMap::new();
-    for claim in claims {
-        let key = (claim.contract_path.clone(), claim.claim_id.clone());
-        if !expected.contains(&key) {
-            return Err(format!(
-                "claim `{}` for contract `{}` is not required by the current PR diff",
-                claim.claim_id, claim.contract_path
-            ));
-        }
-        if provided.insert(key, claim).is_some() {
-            return Err("duplicate reviewed claim in sign_pr request".to_string());
-        }
-    }
-
-    for item in &mut review.items {
-        let key = (item.contract_path.to_string(), item.claim_id.clone());
-        if let Some(claim) = provided.remove(&key) {
-            item.status = Some(claim.status);
-            item.evidence = claim.evidence;
-        }
-    }
-    Ok(())
-}
-
-fn tool_error(error: impl std::fmt::Display) -> String {
-    error.to_string()
 }
 
 // attest: begin
 // scope: function
-// id: attest_core.build_pr_state
+// id: attest_core.build_commit_state
 // module: attest-core
 // claims:
-//   - id: attest_core.build_pr_state_preserves_pr_mental_model
-//     text: build_pr_state preserves the user's mental model that Attest is reviewing one committed PR diff, not a mixture of working tree, cache, and branch state.
+//   - id: attest_core.build_commit_state_preserves_commit_mental_model
+//     text: build_commit_state preserves the user's mental model that Attest is reviewing the staged commit, not a PR, branch, or working tree mixture.
 //     review:
-//       - Explain the product meaning of base, merge-base, head, changed files, and dirty files in this change.
+//       - Explain the product meaning of HEAD, the index tree, changed files, and unstaged files in this change.
 //       - Identify any state that is observed but intentionally not signed.
-//       - Call out any behavior that would surprise a user comparing their branch to the chosen base.
-//   - id: attest_core.build_pr_state_keeps_activation_explainable
-//     text: build_pr_state keeps contract activation explainable from changed paths and changed spans rather than hidden global repository state.
+//       - Call out any behavior that would surprise a user comparing `git diff --cached` to Attest output.
+//   - id: attest_core.build_commit_state_keeps_activation_explainable
+//     text: build_commit_state keeps contract activation explainable from staged paths and staged line changes rather than hidden repository state.
 //     review:
-//       - Explain why each newly active contract would make sense to a maintainer looking at the diff.
-//       - Identify any contract activation that depends on ordering, caching, or unrelated files.
-//       - Call out any behavior that feels conservative enough for pre-push but too noisy for routine use.
+//       - Explain why each newly active contract would make sense to a maintainer looking at the staged diff.
+//       - Identify any activation that depends on unrelated files, branch names, or remotes.
+//       - Call out any behavior that feels conservative enough for pre-commit but too noisy for routine use.
 // attest: end
-fn build_pr_state(ctx: &RepoContext, base_ref: &str) -> Result<PrState> {
-    let base_commit = resolve_commit(&ctx.repo, base_ref)
-        .with_context(|| format!("failed to resolve base ref `{base_ref}`"))?;
-    let head_commit = ctx
+fn build_commit_state(ctx: &RepoContext) -> Result<CommitState> {
+    let mut index = ctx.repo.index().context("failed to read Git index")?;
+    if index.has_conflicts() {
+        bail!("Attest cannot sign a commit while the Git index has unresolved conflicts.");
+    }
+    let staged_tree_oid = index
+        .write_tree()
+        .context("failed to write staged index tree")?;
+    let staged_tree = ctx
         .repo
-        .head()?
-        .peel_to_commit()
-        .context("failed to resolve HEAD")?;
-    let merge_base = ctx.repo.merge_base(base_commit.id(), head_commit.id())?;
-    let merge_base_commit = ctx.repo.find_commit(merge_base)?;
+        .find_tree(staged_tree_oid)
+        .context("failed to read staged index tree")?;
+    let (base_tree_oid, base_sha) = head_tree(ctx)?;
+    let base_tree = ctx
+        .repo
+        .find_tree(base_tree_oid)
+        .context("failed to read HEAD tree")?;
 
-    let diff = diff_between(&ctx.repo, merge_base_commit.id(), head_commit.id())?;
+    let diff = diff_between_trees(&ctx.repo, &base_tree, &staged_tree)?;
     let file_changes = collect_file_changes(&diff)?;
     let changed_files = changed_files_from_changes(&file_changes);
-    let diff_digest = diff_digest(
-        &diff,
-        merge_base_commit.id(),
-        head_commit.id(),
-        &changed_files,
-    )?;
+    let staged_diff_digest = diff_digest(&diff, base_tree_oid, staged_tree_oid, &changed_files)?;
 
-    let contracts = load_directory_contracts_for_paths(ctx, &changed_files)?;
+    let contracts =
+        load_directory_contracts_for_paths(ctx, &changed_files, &base_tree, &staged_tree)?;
     let mut active_contracts = Vec::new();
     for loaded in contracts {
         let matched: Vec<String> = changed_files
@@ -1303,36 +716,49 @@ fn build_pr_state(ctx: &RepoContext, base_ref: &str) -> Result<PrState> {
     active_contracts.extend(load_active_inline_contracts(ctx, &file_changes)?);
     active_contracts.sort_by(|left, right| left.path.cmp(&right.path));
 
-    Ok(PrState {
-        base_ref: base_ref.to_string(),
-        base_sha: base_commit.id().to_string(),
-        merge_base_sha: merge_base_commit.id().to_string(),
-        head_sha: head_commit.id().to_string(),
-        diff_digest,
+    Ok(CommitState {
+        base: "HEAD".to_string(),
+        base_sha,
+        staged_tree: staged_tree_oid.to_string(),
+        staged_diff_digest,
         changed_files,
-        dirty_files: dirty_files(ctx)?,
+        unstaged_files: unstaged_files(ctx)?,
         active_contracts,
         attestation_path: ctx.attestation_path(),
-        review_path: ctx.review_path(),
     })
 }
 
-fn resolve_commit<'repo>(repo: &'repo Repository, refspec: &str) -> Result<git2::Commit<'repo>> {
-    let object = repo.revparse_single(refspec)?;
-    object
-        .peel_to_commit()
-        .context("ref did not resolve to a commit")
+fn head_tree(ctx: &RepoContext) -> Result<(Oid, Option<String>)> {
+    match ctx.repo.head().and_then(|head| head.peel_to_commit()) {
+        Ok(commit) => Ok((commit.tree_id(), Some(commit.id().to_string()))),
+        Err(error)
+            if matches!(
+                error.code(),
+                git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
+            ) =>
+        {
+            Ok((empty_tree_oid(&ctx.repo)?, None))
+        }
+        Err(error) => Err(error).context("failed to resolve HEAD"),
+    }
 }
 
-fn diff_between(repo: &Repository, old: Oid, new: Oid) -> Result<git2::Diff<'_>> {
-    let old_tree = repo.find_commit(old)?.tree()?;
-    let new_tree = repo.find_commit(new)?.tree()?;
+fn empty_tree_oid(repo: &Repository) -> Result<Oid> {
+    let builder = repo.treebuilder(None)?;
+    builder.write().context("failed to create empty tree")
+}
+
+fn diff_between_trees<'repo>(
+    repo: &'repo Repository,
+    old_tree: &Tree<'repo>,
+    new_tree: &Tree<'repo>,
+) -> Result<git2::Diff<'repo>> {
     let mut options = DiffOptions::new();
     options
         .include_untracked(false)
         .recurse_untracked_dirs(false);
-    repo.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), Some(&mut options))
-        .context("failed to compute PR diff")
+    repo.diff_tree_to_tree(Some(old_tree), Some(new_tree), Some(&mut options))
+        .context("failed to compute staged diff")
 }
 
 #[derive(Debug, Clone)]
@@ -1462,8 +888,8 @@ fn changed_files_from_changes(changes: &[FileChange]) -> Vec<String> {
 
 fn diff_digest(
     diff: &git2::Diff<'_>,
-    merge_base: Oid,
-    head: Oid,
+    base_tree: Oid,
+    staged_tree: Oid,
     changed_files: &[String],
 ) -> Result<String> {
     let mut patch = Vec::new();
@@ -1474,10 +900,10 @@ fn diff_digest(
     })?;
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"attest.diff.v1\n");
-    hasher.update(merge_base.to_string().as_bytes());
+    hasher.update(b"attest.staged-diff.v1\n");
+    hasher.update(base_tree.to_string().as_bytes());
     hasher.update(b"\n");
-    hasher.update(head.to_string().as_bytes());
+    hasher.update(staged_tree.to_string().as_bytes());
     hasher.update(b"\n");
     for path in changed_files {
         hasher.update(path.as_bytes());
@@ -1487,7 +913,7 @@ fn diff_digest(
     Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
-fn dirty_files(ctx: &RepoContext) -> Result<Vec<String>> {
+fn unstaged_files(ctx: &RepoContext) -> Result<Vec<String>> {
     let mut options = StatusOptions::new();
     options
         .include_untracked(true)
@@ -1497,7 +923,14 @@ fn dirty_files(ctx: &RepoContext) -> Result<Vec<String>> {
     let statuses = ctx.repo.statuses(Some(&mut options))?;
     let mut paths = BTreeSet::new();
     for entry in statuses.iter() {
-        if let Ok(path) = entry.path() {
+        let status = entry.status();
+        if (status.is_wt_new()
+            || status.is_wt_modified()
+            || status.is_wt_deleted()
+            || status.is_wt_renamed()
+            || status.is_wt_typechange())
+            && let Ok(path) = entry.path()
+        {
             paths.insert(path.replace('\\', "/"));
         }
     }
@@ -1507,6 +940,8 @@ fn dirty_files(ctx: &RepoContext) -> Result<Vec<String>> {
 fn load_directory_contracts_for_paths(
     ctx: &RepoContext,
     changed_files: &[String],
+    base_tree: &Tree<'_>,
+    staged_tree: &Tree<'_>,
 ) -> Result<Vec<LoadedContract>> {
     let mut contracts = Vec::new();
     let mut seen = BTreeSet::new();
@@ -1514,11 +949,11 @@ fn load_directory_contracts_for_paths(
         if !seen.insert(relative.clone()) {
             continue;
         }
-        let path = ctx.root.join(&relative);
-        if !path.is_file() {
+        let staged_bytes = blob_bytes_from_tree(&ctx.repo, staged_tree, &relative)?;
+        let base_bytes = blob_bytes_from_tree(&ctx.repo, base_tree, &relative)?;
+        let Some(bytes) = staged_bytes.or(base_bytes) else {
             continue;
-        }
-        let bytes = fs_err::read(&path).with_context(|| format!("failed to read {path}"))?;
+        };
         let contract: Contract = serde_yaml_ng::from_slice(&bytes)
             .with_context(|| format!("failed to parse contract {relative}"))?;
         validate_contract(&relative, &contract)?;
@@ -1530,6 +965,27 @@ fn load_directory_contracts_for_paths(
         });
     }
     Ok(contracts)
+}
+
+fn blob_bytes_from_tree(
+    repo: &Repository,
+    tree: &Tree<'_>,
+    path: &Utf8Path,
+) -> Result<Option<Vec<u8>>> {
+    let entry = match tree.get_path(path.as_std_path()) {
+        Ok(entry) => entry,
+        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {path} from tree"));
+        }
+    };
+    if entry.kind() != Some(ObjectType::Blob) {
+        return Ok(None);
+    }
+    let blob = repo
+        .find_blob(entry.id())
+        .with_context(|| format!("failed to read blob for {path}"))?;
+    Ok(Some(blob.content().to_vec()))
 }
 
 fn candidate_contract_paths(changed_files: &[String]) -> Vec<Utf8PathBuf> {
@@ -1682,7 +1138,7 @@ struct FunctionCandidate {
 //     text: Inline contract activation treats code movement, contract movement, additions, and deletions as design events that deserve review when they affect ownership.
 //     review:
 //       - Explain what ownership or product expectation changes when a contract appears, disappears, or moves.
-//       - Identify any case where preserving an old signoff would feel misleading to a reviewer.
+//       - Identify any case where preserving old evidence would feel misleading.
 //       - Call out any movement case where review would be noisy rather than useful.
 //   - id: attest_core.inline_matching_respects_locality
 //     text: Inline contract activation respects locality so nearby unrelated edits do not turn precise function contracts into file-wide bureaucracy.
@@ -1944,14 +1400,12 @@ fn inline_contract_needs_attestation(
     old: Option<&CachedInlineContract>,
     new: Option<&CachedInlineContract>,
 ) -> bool {
-    if old.is_none() || new.is_none() {
+    let (Some(old), Some(new)) = (old, new) else {
         return true;
-    }
+    };
     if change.old_path != change.new_path {
         return true;
     }
-    let old = old.expect("checked old contract");
-    let new = new.expect("checked new contract");
     if old.digest != new.digest {
         return true;
     }
@@ -2208,11 +1662,15 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-fn review_template(state: &PrState) -> ReviewFile {
+fn attestation_template(
+    state: &CommitState,
+    agent_kind: &str,
+    agent_session: Option<String>,
+) -> CommitAttestation {
     let mut items = Vec::new();
     for contract in &state.active_contracts {
         for claim in &contract.claims {
-            items.push(ReviewItem {
+            items.push(AttestationItem {
                 contract_path: contract.path.clone(),
                 contract_digest: contract.digest.clone(),
                 module: contract.module.clone(),
@@ -2228,191 +1686,123 @@ fn review_template(state: &PrState) -> ReviewFile {
             });
         }
     }
-    ReviewFile {
-        kind: "attest.review.v1".to_string(),
+    CommitAttestation {
+        kind: COMMIT_ATTESTATION_KIND.to_string(),
         generated_at: Timestamp::now().to_string(),
-        base_ref: state.base_ref.clone(),
+        base: state.base.clone(),
         base_sha: state.base_sha.clone(),
-        merge_base_sha: state.merge_base_sha.clone(),
-        head_sha: state.head_sha.clone(),
-        diff_digest: state.diff_digest.clone(),
+        staged_tree: state.staged_tree.clone(),
+        staged_diff_digest: state.staged_diff_digest.clone(),
+        signoff: AttestationSignoff {
+            agent_kind: agent_kind.to_string(),
+            agent_session,
+            signed_at: None,
+        },
         items,
     }
 }
 
-fn read_review(path: &Utf8Path) -> Result<ReviewFile> {
-    let bytes =
-        fs_err::read(path).with_context(|| format!("failed to read review worksheet {path}"))?;
-    serde_yaml_ng::from_slice(&bytes)
-        .with_context(|| format!("failed to parse review worksheet {path}"))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftAction {
+    Created,
+    Replaced,
+    Kept,
 }
 
-fn signoffs_from_review(state: &PrState, review: &ReviewFile) -> Result<Vec<ContractSignoff>> {
-    if review.kind != "attest.review.v1" {
-        bail!("review worksheet has unsupported kind `{}`", review.kind);
-    }
-    ensure_review_matches_state(state, review)?;
-
-    let mut by_contract: BTreeMap<Utf8PathBuf, Vec<&ReviewItem>> = BTreeMap::new();
-    for item in &review.items {
-        by_contract
-            .entry(item.contract_path.clone())
-            .or_default()
-            .push(item);
-    }
-
-    let mut signoffs = Vec::new();
-    for contract in &state.active_contracts {
-        let items = by_contract
-            .get(&contract.path)
-            .with_context(|| format!("review worksheet is missing contract {}", contract.path))?;
-        let mut by_claim: BTreeMap<&str, &ReviewItem> = BTreeMap::new();
-        for item in items {
-            by_claim.insert(item.claim_id.as_str(), item);
-        }
-
-        let mut claim_signoffs = Vec::new();
-        for claim in &contract.claims {
-            let item = by_claim.get(claim.id.as_str()).with_context(|| {
-                format!(
-                    "review worksheet is missing claim `{}` for {}",
-                    claim.id, contract.path
-                )
-            })?;
-            if item.status != Some(ClaimStatus::True) {
-                bail!(
-                    "claim `{}` in {} is not true; fix the code or leave the PR unsigned",
-                    claim.id,
-                    contract.path
-                );
-            }
-            if claim.evidence_required && item.evidence.iter().all(|line| line.trim().is_empty()) {
-                bail!(
-                    "claim `{}` in {} requires evidence before signing",
-                    claim.id,
-                    contract.path
-                );
-            }
-            claim_signoffs.push(ClaimSignoff {
-                id: claim.id.clone(),
-                status: ClaimStatus::True,
-                evidence: clean_evidence(&item.evidence),
-            });
-        }
-
-        signoffs.push(ContractSignoff {
-            path: contract.path.clone(),
-            digest: contract.digest.clone(),
-            module: contract.module.clone(),
-            source: contract.source,
-            target: contract.target.clone(),
-            claims: claim_signoffs,
-        });
+fn ensure_draft_for_state(
+    ctx: &RepoContext,
+    state: &CommitState,
+    path: &Utf8Path,
+    agent_kind: &str,
+    agent_session: Option<String>,
+    force: bool,
+) -> Result<DraftAction> {
+    let existing = classify_existing_draft(path, state)?;
+    if existing == DraftAction::Kept && !force {
+        return Ok(DraftAction::Kept);
     }
 
-    Ok(signoffs)
+    ctx.ensure_attest_dir()?;
+    let draft = attestation_template(state, agent_kind, agent_session);
+    let yaml = attestation_yaml(&draft).context("failed to serialize attestation draft")?;
+    fs_err::write(path, yaml).with_context(|| format!("failed to write {path}"))?;
+    Ok(match existing {
+        DraftAction::Created => DraftAction::Created,
+        DraftAction::Kept | DraftAction::Replaced => DraftAction::Replaced,
+    })
 }
 
-fn ensure_review_matches_state(state: &PrState, review: &ReviewFile) -> Result<()> {
-    if review.base_sha != state.base_sha {
-        bail!(
-            "review worksheet is stale: base sha is {}, current base sha is {}",
-            review.base_sha,
-            state.base_sha
-        );
+fn classify_existing_draft(path: &Utf8Path, state: &CommitState) -> Result<DraftAction> {
+    let bytes = match fs_err::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DraftAction::Created);
+        }
+        Err(error) => return Err(error).with_context(|| format!("failed to read {path}")),
+    };
+    if let Ok(attestation) = serde_yaml_ng::from_slice::<CommitAttestation>(&bytes)
+        && attestation_matches_state(state, &attestation)
+    {
+        return Ok(DraftAction::Kept);
     }
-    if review.head_sha != state.head_sha {
-        bail!(
-            "review worksheet is stale: head sha is {}, current head sha is {}",
-            review.head_sha,
-            state.head_sha
-        );
+    if String::from_utf8_lossy(&bytes).contains(&state.staged_diff_digest) {
+        return Ok(DraftAction::Kept);
     }
-    if review.diff_digest != state.diff_digest {
-        bail!(
-            "review worksheet is stale: diff digest is {}, current diff digest is {}",
-            review.diff_digest,
-            state.diff_digest
-        );
-    }
-    Ok(())
+    Ok(DraftAction::Replaced)
 }
 
-fn prompt_for_signoffs(state: &PrState) -> Result<Vec<ContractSignoff>> {
-    let mut signoffs = Vec::new();
-    for contract in &state.active_contracts {
-        println!("\nContract: {} ({})", contract.module, contract.path);
-        println!("Changed files:");
-        for path in &contract.changed_files {
-            println!("  - {path}");
-        }
+fn attestation_yaml(attestation: &CommitAttestation) -> Result<String> {
+    Ok(format!(
+        "{}{}",
+        attestation_instructions(),
+        serde_yaml_ng::to_string(attestation)?
+    ))
+}
 
-        let mut claim_signoffs = Vec::new();
-        for claim in &contract.claims {
-            println!("\nClaim: {}", claim.id);
-            println!("{}", claim.text);
-            for question in &claim.review {
-                println!("  - {question}");
-            }
-            let status = Select::new(
-                "Is this claim true after reviewing the diff?",
-                vec![ClaimStatus::True, ClaimStatus::False, ClaimStatus::Unsure],
+fn attestation_instructions() -> &'static str {
+    "# Attest commit signoff\n\
+#\n\
+# This file blocks the current git commit until every required claim is reviewed.\n\
+#\n\
+# Required procedure:\n\
+# 1. Inspect the staged diff for this commit.\n\
+# 2. Read each contract and each changed file listed below.\n\
+# 3. For each claim, set status to true only if the claim is actually satisfied.\n\
+# 4. Add concrete evidence from the diff for every true claim.\n\
+# 5. If any claim is false or unsure, do not sign. Report the blocker.\n\
+# 6. Set signed_at after reviewing every claim.\n\
+# 7. Run git commit again.\n\
+#\n\
+# Do not sign mechanically. This is not a checklist to rubber-stamp.\n\n"
+}
+
+fn read_attestation(path: &Utf8Path) -> Result<CommitAttestation> {
+    let bytes = match fs_err::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "missing attestation draft at {path}; run `attest review` or `git commit` to create it"
             )
-            .prompt()
-            .context("failed to read claim status")?;
-
-            if status != ClaimStatus::True {
-                bail!(
-                    "claim `{}` was not confirmed true; fix the code or leave the PR unsigned",
-                    claim.id
-                );
-            }
-
-            let mut evidence = Vec::new();
-            loop {
-                let line = Text::new("Evidence (blank to finish):")
-                    .prompt()
-                    .context("failed to read evidence")?;
-                if line.trim().is_empty() {
-                    break;
-                }
-                evidence.push(line);
-            }
-            if claim.evidence_required && evidence.is_empty() {
-                bail!("claim `{}` requires evidence before signing", claim.id);
-            }
-
-            claim_signoffs.push(ClaimSignoff {
-                id: claim.id.clone(),
-                status,
-                evidence,
-            });
         }
-        signoffs.push(ContractSignoff {
-            path: contract.path.clone(),
-            digest: contract.digest.clone(),
-            module: contract.module.clone(),
-            source: contract.source,
-            target: contract.target.clone(),
-            claims: claim_signoffs,
-        });
-    }
-    Ok(signoffs)
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read attestation draft {path}"));
+        }
+    };
+    serde_yaml_ng::from_slice(&bytes)
+        .with_context(|| format!("failed to parse attestation draft {path}"))
 }
 
-impl std::fmt::Display for ClaimStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClaimStatus::True => write!(f, "true"),
-            ClaimStatus::False => write!(f, "false"),
-            ClaimStatus::Unsure => write!(f, "unsure"),
-        }
-    }
+fn attestation_matches_state(state: &CommitState, attestation: &CommitAttestation) -> bool {
+    attestation.kind == COMMIT_ATTESTATION_KIND
+        && attestation.base == state.base
+        && attestation.base_sha == state.base_sha
+        && attestation.staged_tree == state.staged_tree
+        && attestation.staged_diff_digest == state.staged_diff_digest
 }
 
 fn verify_state(
     ctx: &RepoContext,
-    state: &PrState,
+    state: &CommitState,
     attestation_path: Option<&Utf8PathBuf>,
 ) -> Result<VerifyReport> {
     let mut blockers = Vec::new();
@@ -2431,29 +1821,17 @@ fn verify_state(
     let path = attestation_path
         .cloned()
         .unwrap_or_else(|| ctx.attestation_path());
-    let attestation = match fs_err::read(&path) {
-        Ok(bytes) => match serde_json::from_slice::<Attestation>(&bytes) {
-            Ok(attestation) => Some(attestation),
-            Err(error) => {
-                blockers.push(format!("failed to parse attestation {path}: {error}"));
-                None
-            }
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            blockers.push(format!(
-                "missing PR attestation at {path}; run `attest review-pr` and `attest sign-pr --from-review`"
-            ));
-            None
-        }
+    let attestation = match read_attestation(&path) {
+        Ok(attestation) => Some(attestation),
         Err(error) => {
-            blockers.push(format!("failed to read attestation {path}: {error}"));
+            blockers.push(format!("{error}"));
             None
         }
     };
 
     if let Some(attestation) = &attestation {
         verify_attestation_freshness(state, attestation, &mut blockers);
-        verify_attestation_contracts(state, attestation, &mut blockers, &mut warnings);
+        verify_attestation_items(state, attestation, &mut blockers, &mut warnings);
     }
 
     let verdict = if blockers.is_empty() {
@@ -2467,130 +1845,172 @@ fn verify_state(
         blockers,
         warnings,
         required_contracts: state.active_contracts.clone(),
-        attestation: attestation.map(|attestation| AttestationSummary {
-            path,
-            signed_at: attestation.signed_at,
-            agent: attestation.agent,
+        attestation: attestation.and_then(|attestation| {
+            attestation
+                .signoff
+                .signed_at
+                .map(|signed_at| AttestationSummary {
+                    path,
+                    signed_at,
+                    agent_kind: attestation.signoff.agent_kind,
+                    agent_session: attestation.signoff.agent_session,
+                })
         }),
     })
 }
 
 fn verify_attestation_freshness(
-    state: &PrState,
-    attestation: &Attestation,
+    state: &CommitState,
+    attestation: &CommitAttestation,
     blockers: &mut Vec<String>,
 ) {
-    if attestation.kind != "attest.pr.v1" {
+    if attestation.kind != COMMIT_ATTESTATION_KIND {
         blockers.push(format!(
             "attestation kind `{}` is unsupported",
             attestation.kind
         ));
     }
+    if attestation.base != state.base {
+        blockers.push(format!(
+            "attestation base is stale: signed {}, current {}",
+            attestation.base, state.base
+        ));
+    }
     if attestation.base_sha != state.base_sha {
         blockers.push(format!(
             "attestation base sha is stale: signed {}, current {}",
-            attestation.base_sha, state.base_sha
+            optional_sha(&attestation.base_sha),
+            optional_sha(&state.base_sha)
         ));
     }
-    if attestation.head_sha != state.head_sha {
+    if attestation.staged_tree != state.staged_tree {
         blockers.push(format!(
-            "attestation head sha is stale: signed {}, current {}",
-            attestation.head_sha, state.head_sha
+            "attestation staged tree is stale: signed {}, current {}",
+            attestation.staged_tree, state.staged_tree
         ));
     }
-    if attestation.diff_digest != state.diff_digest {
+    if attestation.staged_diff_digest != state.staged_diff_digest {
         blockers.push(format!(
-            "attestation diff digest is stale: signed {}, current {}",
-            attestation.diff_digest, state.diff_digest
+            "attestation staged diff digest is stale: signed {}, current {}",
+            attestation.staged_diff_digest, state.staged_diff_digest
         ));
+    }
+    if attestation.signoff.signed_at.is_none() {
+        blockers.push("attestation signoff.signed_at is not set".to_string());
     }
 }
 
-fn verify_attestation_contracts(
-    state: &PrState,
-    attestation: &Attestation,
+fn verify_attestation_items(
+    state: &CommitState,
+    attestation: &CommitAttestation,
     blockers: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) {
-    let mut signed_by_path: BTreeMap<&Utf8PathBuf, &ContractSignoff> = BTreeMap::new();
-    for signoff in &attestation.contracts {
-        signed_by_path.insert(&signoff.path, signoff);
+    let mut expected = BTreeMap::<(Utf8PathBuf, String), (&ActiveContract, &Claim)>::new();
+    for contract in &state.active_contracts {
+        for claim in &contract.claims {
+            expected.insert((contract.path.clone(), claim.id.clone()), (contract, claim));
+        }
     }
 
-    for contract in &state.active_contracts {
-        let Some(signoff) = signed_by_path.get(&contract.path) else {
-            blockers.push(format!("missing signoff for contract {}", contract.path));
-            continue;
-        };
-        if signoff.digest != contract.digest {
+    let mut actual = BTreeMap::<(Utf8PathBuf, String), &AttestationItem>::new();
+    for item in &attestation.items {
+        let key = (item.contract_path.clone(), item.claim_id.clone());
+        if actual.insert(key, item).is_some() {
             blockers.push(format!(
-                "contract {} changed since signing: signed {}, current {}",
-                contract.path, signoff.digest, contract.digest
+                "duplicate attestation item for claim `{}` in {}",
+                item.claim_id, item.contract_path
             ));
         }
+    }
 
-        let mut claims_by_id: BTreeMap<&str, &ClaimSignoff> = BTreeMap::new();
-        for claim in &signoff.claims {
-            claims_by_id.insert(claim.id.as_str(), claim);
+    for (key, (contract, claim)) in &expected {
+        let Some(item) = actual.get(key) else {
+            blockers.push(format!(
+                "missing attestation item for claim `{}` in {}",
+                claim.id, contract.path
+            ));
+            continue;
+        };
+        if item.contract_digest != contract.digest {
+            blockers.push(format!(
+                "contract {} changed since draft creation: signed {}, current {}",
+                contract.path, item.contract_digest, contract.digest
+            ));
         }
-
-        for claim in &contract.claims {
-            let Some(claim_signoff) = claims_by_id.get(claim.id.as_str()) else {
-                blockers.push(format!(
-                    "missing signoff for claim `{}` in {}",
-                    claim.id, contract.path
-                ));
-                continue;
-            };
-            if claim_signoff.status != ClaimStatus::True {
-                blockers.push(format!(
-                    "claim `{}` in {} was signed as `{}`",
-                    claim.id, contract.path, claim_signoff.status
-                ));
-            }
-            if claim.evidence_required
-                && claim_signoff
-                    .evidence
-                    .iter()
-                    .all(|line| line.trim().is_empty())
-            {
-                blockers.push(format!(
-                    "claim `{}` in {} has no evidence",
-                    claim.id, contract.path
-                ));
-            }
+        if item.status != Some(ClaimStatus::True) {
+            blockers.push(format!(
+                "claim `{}` in {} is not signed true",
+                claim.id, contract.path
+            ));
+        }
+        if claim.evidence_required && clean_evidence(&item.evidence).is_empty() {
+            blockers.push(format!(
+                "claim `{}` in {} requires evidence",
+                claim.id, contract.path
+            ));
         }
     }
 
-    for signoff in &attestation.contracts {
-        if !state
-            .active_contracts
-            .iter()
-            .any(|contract| contract.path == signoff.path)
-        {
+    for (key, item) in actual {
+        if !expected.contains_key(&key) {
             warnings.push(format!(
-                "attestation contains non-required contract {}",
-                signoff.path
+                "attestation contains non-required claim `{}` in {}",
+                item.claim_id, item.contract_path
             ));
         }
     }
 }
 
-fn print_state(state: &PrState) {
-    println!("Base: {} ({})", state.base_ref, short_sha(&state.base_sha));
-    println!("Head: {}", short_sha(&state.head_sha));
-    println!("Diff: {}", state.diff_digest);
+fn pre_commit_block_message(
+    ctx: &RepoContext,
+    state: &CommitState,
+    path: &Utf8Path,
+    action: DraftAction,
+) -> String {
+    let mut message =
+        String::from("You need to sign these Attest contracts before committing:\n\n");
+    for contract in &state.active_contracts {
+        message.push_str(&format!("- {}\n", contract.path));
+        for claim in &contract.claims {
+            message.push_str(&format!("  - {}\n", claim.id));
+        }
+    }
+    let path = display_path(ctx, path);
+    let line = match action {
+        DraftAction::Created | DraftAction::Replaced => "Attestation draft written to:",
+        DraftAction::Kept => "Attestation draft is waiting at:",
+    };
+    message.push_str(&format!(
+        "\n{line}\n  {path}\n\nFollow the instructions at the top of that file, then run:\n  git commit\n"
+    ));
+    message
+}
+
+fn display_path(ctx: &RepoContext, path: &Utf8Path) -> String {
+    path.strip_prefix(&ctx.root)
+        .map(|path| path.to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+fn print_state(state: &CommitState) {
+    match &state.base_sha {
+        Some(base_sha) => println!("Base: HEAD ({})", short_sha(base_sha)),
+        None => println!("Base: HEAD (unborn)"),
+    }
+    println!("Staged tree: {}", short_sha(&state.staged_tree));
+    println!("Staged diff: {}", state.staged_diff_digest);
     if state.changed_files.is_empty() {
-        println!("Changed files: none");
+        println!("Staged files: none");
     } else {
-        println!("Changed files:");
+        println!("Staged files:");
         for file in &state.changed_files {
             println!("  - {file}");
         }
     }
-    if !state.dirty_files.is_empty() {
-        println!("Uncommitted files:");
-        for file in &state.dirty_files {
+    if !state.unstaged_files.is_empty() {
+        println!("Unstaged files not covered by this attestation:");
+        for file in &state.unstaged_files {
             println!("  - {file}");
         }
     }
@@ -2648,6 +2068,16 @@ fn print_report(report: &VerifyReport) {
     }
 }
 
+impl std::fmt::Display for ClaimStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClaimStatus::True => write!(f, "true"),
+            ClaimStatus::False => write!(f, "false"),
+            ClaimStatus::Unsure => write!(f, "unsure"),
+        }
+    }
+}
+
 fn normalize_std_path(path: &Path) -> Option<String> {
     let path = Utf8Path::from_path(path)?;
     Some(path.as_str().replace('\\', "/"))
@@ -2669,15 +2099,8 @@ fn short_sha(sha: &str) -> &str {
     sha.get(..8).unwrap_or(sha)
 }
 
-fn shell_quote(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.'))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
+fn optional_sha(sha: &Option<String>) -> String {
+    sha.as_deref().unwrap_or("<none>").to_string()
 }
 
 fn default_contract_version() -> u32 {
@@ -2686,6 +2109,10 @@ fn default_contract_version() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_agent_kind() -> String {
+    "codex".to_string()
 }
 
 #[cfg(unix)]
@@ -2714,20 +2141,6 @@ mod tests {
     }
 
     #[test]
-    fn shell_quote_leaves_simple_refs_readable() {
-        assert_eq!(shell_quote("origin/main"), "origin/main");
-        assert_eq!(shell_quote("feature/test_1"), "feature/test_1");
-    }
-
-    #[test]
-    fn shell_quote_handles_spaces() {
-        assert_eq!(
-            shell_quote("origin/main with space"),
-            "'origin/main with space'"
-        );
-    }
-
-    #[test]
     fn directory_scope_matches_descendants() {
         assert!(path_is_within_scope("README.md", ""));
         assert!(path_is_within_scope("crates/engine", "crates/engine"));
@@ -2742,20 +2155,23 @@ mod tests {
     }
 
     #[test]
-    fn mcp_server_exposes_attest_tools() {
-        let server = AttestMcpServer::new();
-        let tool_names = server
-            .tool_router
-            .list_all()
-            .iter()
-            .map(|tool| tool.name.to_string())
-            .collect::<BTreeSet<_>>();
-        assert!(tool_names.contains("status_pr"));
-        assert!(tool_names.contains("create_review"));
-        assert!(tool_names.contains("sign_pr"));
-        assert!(tool_names.contains("verify_pr"));
-        assert!(tool_names.contains("init_contract"));
-        assert!(tool_names.contains("install_hooks"));
-        assert!(tool_names.contains("explain_inline"));
+    fn generated_attestation_starts_with_agent_instructions() {
+        let attestation = CommitAttestation {
+            kind: COMMIT_ATTESTATION_KIND.to_string(),
+            generated_at: Timestamp::now().to_string(),
+            base: "HEAD".to_string(),
+            base_sha: None,
+            staged_tree: "tree".to_string(),
+            staged_diff_digest: "blake3:digest".to_string(),
+            signoff: AttestationSignoff {
+                agent_kind: "codex".to_string(),
+                agent_session: None,
+                signed_at: None,
+            },
+            items: Vec::new(),
+        };
+        let yaml = attestation_yaml(&attestation).unwrap();
+        assert!(yaml.starts_with("# Attest commit signoff"));
+        assert!(yaml.contains("If any claim is false or unsure, do not sign. Report the blocker."));
     }
 }

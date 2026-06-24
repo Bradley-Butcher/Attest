@@ -1,11 +1,12 @@
 ---
 source: tests/cli_snapshots.rs
+assertion_line: 13
 expression: output
 ---
-Base: HEAD~1 (<SHORT_SHA>)
-Head: <SHORT_SHA>
-Diff: blake3:<DIGEST>
-Changed files:
+Base: HEAD (<SHORT_SHA>)
+Staged tree: <SHORT_SHA>
+Staged diff: blake3:<DIGEST>
+Staged files:
   - crates/engine/src/lib.rs
 Required contracts:
   - repo (AGENT_CONTRACT.yaml, scope: <repo>)
@@ -16,4 +17,4 @@ Required contracts:
       target: function guarded lines 9-14
       - engine.no_test_case_heuristics
 Attest verification: blocked
-blocker: missing PR attestation at <ATTESTATION_PATH>; run `attest review-pr` and `attest sign-pr --from-review`
+blocker: missing attestation draft at <ATTESTATION_PATH>; run `attest review` or `git commit` to create it

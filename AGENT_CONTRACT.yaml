@@ -11,7 +11,7 @@ claims:
   - id: attest.abstractions_name_product_concepts
     text: New names and boundaries describe the product concept they protect, not the incidental implementation mechanism that made the change convenient.
     review:
-      - List every new command, MCP tool, schema field, target kind, module, type, or persisted file shape.
+      - List every new command, hook adapter, schema field, target kind, module, type, or persisted file shape.
       - Explain the user-facing or maintainer-facing concept each name represents.
       - Call out any name that is temporary, overloaded, too broad, or tied to one implementation detail.
 
@@ -25,6 +25,6 @@ claims:
   - id: attest.agent_accountability_is_preserved
     text: Agent-facing flows make the agent accountable for the truth of each claim rather than optimizing for satisfying a checklist.
     review:
-      - List every changed prompt, hook message, worksheet field, MCP instruction, or signing path.
+      - List every changed prompt, hook message, attestation field, or signing path.
       - Explain how the flow handles false, unsure, stale, missing, or evidence-poor claims.
       - Remove or revise wording that implies signing is the default next step after a warning.

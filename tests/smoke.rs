@@ -1,12 +1,13 @@
 use assert_cmd::Command;
-use attest_contracts::{ClaimStatus, ReviewFile};
+use attest_contracts::{ClaimStatus, CommitAttestation};
 use camino::Utf8PathBuf;
+use jiff::Timestamp;
 use predicates::prelude::*;
 use std::process::Command as StdCommand;
 use tempfile::TempDir;
 
 #[test]
-fn nested_change_requires_root_and_directory_contracts() {
+fn pre_commit_hook_writes_draft_and_blocks_until_signed() {
     let repo = TestRepo::new();
     repo.write(
         "AGENT_CONTRACT.yaml",
@@ -17,99 +18,117 @@ claims:
     text: I reviewed the whole repo impact.
 "#,
     );
-    repo.write(
-        "crates/engine/AGENT_CONTRACT.yaml",
-        r#"version: 1
-module: engine
-claims:
-  - id: engine.no_test_case_heuristics
-    text: I did not add test-case-specific engine logic.
-"#,
-    );
-    repo.write(
-        "crates/engine/src/lib.rs",
-        "pub fn answer() -> u32 { 41 }\n",
-    );
-    repo.git(["add", "."]);
-    repo.git(["commit", "-m", "initial"]);
+    repo.write("src/lib.rs", "pub fn answer() -> u32 { 41 }\n");
+    repo.commit_all("initial");
 
-    repo.write(
-        "crates/engine/src/lib.rs",
-        "pub fn answer() -> u32 { 42 }\n",
-    );
-    repo.git(["add", "."]);
-    repo.git(["commit", "-m", "update engine"]);
+    repo.write("src/lib.rs", "pub fn answer() -> u32 { 42 }\n");
+    repo.stage_all();
 
     Command::cargo_bin("attest")
         .unwrap()
-        .args(["review-pr", "--repo", repo.path(), "--base", "HEAD~1"])
+        .args(["pre-commit-hook", "--repo", repo.path()])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains(
+            "You need to sign these Attest contracts before committing",
+        ))
+        .stderr(predicate::str::contains("AGENT_CONTRACT.yaml"))
+        .stderr(predicate::str::contains("repo.reviewed"))
+        .stderr(predicate::str::contains(
+            ".git/attest/pending-attestation.yaml",
+        ))
+        .stderr(predicate::str::contains("git commit"));
 
-    let review_path = repo.root.join(".git/attest/pr-review.yaml");
-    let review_bytes = std::fs::read(&review_path).unwrap();
-    let mut review: ReviewFile = serde_yaml_ng::from_slice(&review_bytes).unwrap();
-    let mut claim_ids = review
-        .items
-        .iter()
-        .map(|item| item.claim_id.clone())
-        .collect::<Vec<_>>();
-    claim_ids.sort();
-    assert_eq!(
-        claim_ids,
-        vec![
-            "engine.no_test_case_heuristics".to_string(),
-            "repo.reviewed".to_string()
-        ]
-    );
-
-    for item in &mut review.items {
-        item.status = Some(ClaimStatus::True);
-        item.evidence = vec![format!("reviewed {}", item.claim_id)];
-    }
-    std::fs::write(&review_path, serde_yaml_ng::to_string(&review).unwrap()).unwrap();
+    let mut attestation = repo.read_attestation();
+    assert!(attestation.signoff.signed_at.is_none());
+    sign_all(&mut attestation);
+    repo.write_attestation(&attestation);
 
     Command::cargo_bin("attest")
         .unwrap()
-        .args([
-            "sign-pr",
-            "--repo",
-            repo.path(),
-            "--base",
-            "HEAD~1",
-            "--from-review",
-        ])
-        .assert()
-        .success();
-
-    Command::cargo_bin("attest")
-        .unwrap()
-        .args(["verify-pr", "--repo", repo.path(), "--base", "HEAD~1"])
+        .args(["verify", "--repo", repo.path()])
         .assert()
         .success()
         .stdout(predicate::str::contains("accepted"));
 
-    repo.write(
-        "crates/engine/src/lib.rs",
-        "pub fn answer() -> u32 { 43 }\n",
-    );
-    repo.git(["add", "."]);
-    repo.git(["commit", "-m", "change after signing"]);
+    Command::cargo_bin("attest")
+        .unwrap()
+        .args(["pre-commit-hook", "--repo", repo.path()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn pre_commit_hook_keeps_existing_draft_for_same_staged_diff() {
+    let repo = TestRepo::with_root_contract();
+    repo.write("src/lib.rs", "pub fn answer() -> u32 { 42 }\n");
+    repo.stage_all();
 
     Command::cargo_bin("attest")
         .unwrap()
-        .args(["verify-pr", "--repo", repo.path(), "--base", "HEAD~2"])
+        .args(["pre-commit-hook", "--repo", repo.path()])
+        .assert()
+        .failure();
+
+    let mut attestation = repo.read_attestation();
+    attestation.items[0].evidence = vec!["partial evidence survives".to_string()];
+    repo.write_attestation(&attestation);
+
+    Command::cargo_bin("attest")
+        .unwrap()
+        .args(["pre-commit-hook", "--repo", repo.path()])
         .assert()
         .failure()
-        .stdout(predicate::str::contains("head sha is stale"));
+        .stderr(predicate::str::contains("Attestation draft is waiting at"));
+
+    let bytes = std::fs::read_to_string(repo.attestation_path()).unwrap();
+    assert!(bytes.contains("partial evidence survives"));
+}
+
+#[test]
+fn pre_commit_hook_refreshes_stale_draft_when_staged_diff_changes() {
+    let repo = TestRepo::with_root_contract();
+    repo.write("src/lib.rs", "pub fn answer() -> u32 { 42 }\n");
+    repo.stage_all();
 
     Command::cargo_bin("attest")
         .unwrap()
-        .args(["codex-stop-hook", "--repo", repo.path(), "--base", "HEAD~2"])
+        .args(["pre-commit-hook", "--repo", repo.path()])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("\"continue\": false"))
-        .stdout(predicate::str::contains("Do not sign mechanically"));
+        .failure();
+
+    let mut attestation = repo.read_attestation();
+    let old_digest = attestation.staged_diff_digest.clone();
+    attestation.items[0].evidence = vec!["old evidence".to_string()];
+    repo.write_attestation(&attestation);
+
+    repo.write("src/lib.rs", "pub fn answer() -> u32 { 43 }\n");
+    repo.stage_all();
+
+    Command::cargo_bin("attest")
+        .unwrap()
+        .args(["pre-commit-hook", "--repo", repo.path()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Attestation draft written to"));
+
+    let refreshed = repo.read_attestation();
+    assert_ne!(refreshed.staged_diff_digest, old_digest);
+    assert!(refreshed.items[0].evidence.is_empty());
+}
+
+#[test]
+fn installed_pre_commit_hook_runs_attest() {
+    let repo = TestRepo::with_root_contract();
+
+    Command::cargo_bin("attest")
+        .unwrap()
+        .args(["install-hooks", "--repo", repo.path()])
+        .assert()
+        .success();
+
+    let hook = std::fs::read_to_string(repo.root.join(".git/hooks/pre-commit")).unwrap();
+    assert!(hook.contains("attest pre-commit-hook"));
 }
 
 #[test]
@@ -134,8 +153,7 @@ pub fn other() -> u32 {
 }
 "#,
     );
-    repo.git(["add", "."]);
-    repo.git(["commit", "-m", "initial inline contract"]);
+    repo.commit_all("initial inline contract");
 
     Command::cargo_bin("attest")
         .unwrap()
@@ -166,22 +184,16 @@ pub fn other() -> u32 {
 }
 "#,
     );
-    repo.git(["add", "."]);
-    repo.git(["commit", "-m", "change import"]);
+    repo.stage_all();
 
     Command::cargo_bin("attest")
         .unwrap()
-        .args([
-            "status",
-            "--repo",
-            repo.path(),
-            "--base",
-            "HEAD~1",
-            "--json",
-        ])
+        .args(["status", "--repo", repo.path(), "--json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("engine.no_test_case_heuristics").not());
+
+    repo.commit_all("change import");
 
     repo.write(
         "src/lib.rs",
@@ -207,20 +219,17 @@ pub fn other() -> u32 {
 }
 "#,
     );
-    repo.git(["add", "."]);
-    repo.git(["commit", "-m", "change guarded"]);
+    repo.stage_all();
 
     Command::cargo_bin("attest")
         .unwrap()
-        .args(["review-pr", "--repo", repo.path(), "--base", "HEAD~1"])
+        .args(["review", "--repo", repo.path()])
         .assert()
         .success();
 
-    let review_path = repo.root.join(".git/attest/pr-review.yaml");
-    let review_bytes = std::fs::read(&review_path).unwrap();
-    let review: ReviewFile = serde_yaml_ng::from_slice(&review_bytes).unwrap();
-    assert_eq!(review.items.len(), 1);
-    let item = &review.items[0];
+    let attestation = repo.read_attestation();
+    assert_eq!(attestation.items.len(), 1);
+    let item = &attestation.items[0];
     assert_eq!(
         item.contract_path.as_str(),
         "src/lib.rs#attest:engine.guarded"
@@ -228,6 +237,14 @@ pub fn other() -> u32 {
     assert_eq!(item.claim_id, "engine.no_test_case_heuristics");
     let target = item.target.as_ref().unwrap();
     assert_eq!(target.symbol.as_deref(), Some("guarded"));
+}
+
+fn sign_all(attestation: &mut CommitAttestation) {
+    attestation.signoff.signed_at = Some(Timestamp::now());
+    for item in &mut attestation.items {
+        item.status = Some(ClaimStatus::True);
+        item.evidence = vec![format!("reviewed {}", item.claim_id)];
+    }
 }
 
 struct TestRepo {
@@ -248,14 +265,56 @@ impl TestRepo {
         repo
     }
 
+    fn with_root_contract() -> Self {
+        let repo = Self::new();
+        repo.write(
+            "AGENT_CONTRACT.yaml",
+            r#"version: 1
+module: repo
+claims:
+  - id: repo.reviewed
+    text: I reviewed the repo-level impact.
+"#,
+        );
+        repo.write("src/lib.rs", "pub fn answer() -> u32 { 41 }\n");
+        repo.commit_all("initial");
+        repo
+    }
+
     fn path(&self) -> &str {
         self.root.as_str()
+    }
+
+    fn attestation_path(&self) -> Utf8PathBuf {
+        self.root.join(".git/attest/pending-attestation.yaml")
     }
 
     fn write(&self, path: &str, contents: &str) {
         let path = self.root.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
+    }
+
+    fn stage_all(&self) {
+        self.git(["add", "."]);
+    }
+
+    fn commit_all(&self, message: &str) {
+        self.stage_all();
+        self.git(["commit", "-m", message]);
+    }
+
+    fn read_attestation(&self) -> CommitAttestation {
+        let bytes = std::fs::read(self.attestation_path()).unwrap();
+        serde_yaml_ng::from_slice(&bytes).unwrap()
+    }
+
+    fn write_attestation(&self, attestation: &CommitAttestation) {
+        std::fs::write(
+            self.attestation_path(),
+            serde_yaml_ng::to_string(attestation).unwrap(),
+        )
+        .unwrap();
     }
 
     fn git<const N: usize>(&self, args: [&str; N]) {
