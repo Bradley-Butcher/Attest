@@ -128,33 +128,33 @@ if __name__ == "__main__":
 fn inline_file_contract_applies_to_file_staged_change() {
     let repo = TestRepo::new();
     repo.write(
-        "docs/release.md",
+        "scripts/release_notes.py",
         r#"# attest: begin
 # scope: file
-# id: docs.release_notes
-# module: docs
+# id: scripts.release_notes
+# module: scripts
 # claims:
-#   - id: docs.release_notes_reviewed
-#     text: Release notes accurately describe user-visible behavior.
+#   - id: scripts.release_notes_reviewed
+#     text: Release note generation accurately describes user-visible behavior.
 # attest: end
 
-Initial release notes.
+NOTES = "Initial release notes."
 "#,
     );
     repo.commit_all("initial docs");
 
     repo.write(
-        "docs/release.md",
+        "scripts/release_notes.py",
         r#"# attest: begin
 # scope: file
-# id: docs.release_notes
-# module: docs
+# id: scripts.release_notes
+# module: scripts
 # claims:
-#   - id: docs.release_notes_reviewed
-#     text: Release notes accurately describe user-visible behavior.
+#   - id: scripts.release_notes_reviewed
+#     text: Release note generation accurately describes user-visible behavior.
 # attest: end
 
-Updated release notes.
+NOTES = "Updated release notes."
 "#,
     );
     repo.stage_all();
@@ -163,12 +163,12 @@ Updated release notes.
     let item = only_attestation_item(&attestation);
     assert_eq!(
         item.contract_path.as_str(),
-        "docs/release.md#attest:docs.release_notes"
+        "scripts/release_notes.py#attest:scripts.release_notes"
     );
-    assert_eq!(item.claim_id, "docs.release_notes_reviewed");
+    assert_eq!(item.claim_id, "scripts.release_notes_reviewed");
     let target = item.target.as_ref().expect("file target");
     assert_eq!(target.kind, ContractTargetKind::File);
-    assert_eq!(target.path, "docs/release.md");
+    assert_eq!(target.path, "scripts/release_notes.py");
 }
 
 #[test]

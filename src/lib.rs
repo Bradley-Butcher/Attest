@@ -602,6 +602,9 @@ fn inline_contracts_from_worktree(
     ctx: &RepoContext,
     relative: &Utf8Path,
 ) -> Result<Vec<CachedInlineContract>> {
+    if !inline_contracts_supported_for_path(relative.as_str()) {
+        return Ok(Vec::new());
+    }
     let full_path = ctx.root.join(relative);
     let bytes = fs_err::read(&full_path).with_context(|| format!("failed to read {full_path}"))?;
     parse_inline_contract_blob(
@@ -1197,6 +1200,9 @@ fn read_inline_contracts_for_side(
     let Some(path) = path else {
         return Ok(Vec::new());
     };
+    if !inline_contracts_supported_for_path(path) {
+        return Ok(Vec::new());
+    }
     let Some(oid) = oid else {
         return Ok(Vec::new());
     };
@@ -1245,6 +1251,13 @@ fn inline_cache_path(ctx: &RepoContext, oid: Oid, language: &str) -> Utf8PathBuf
         .join(format!("{oid}-{language}.json"))
 }
 
+fn inline_contracts_supported_for_path(path: &str) -> bool {
+    !matches!(
+        Utf8Path::new(path).extension(),
+        Some("md" | "markdown" | "mdx" | "rst" | "txt")
+    )
+}
+
 // attest: begin
 // scope: function
 // id: attest_core.parse_inline_contract_blob
@@ -1270,7 +1283,11 @@ fn parse_inline_contract_blob(
 ) -> Result<Vec<CachedInlineContract>> {
     let source = std::str::from_utf8(bytes)
         .with_context(|| format!("{path} contains inline contracts but is not UTF-8"))?;
-    let blocks = extract_inline_blocks(source);
+    let parsed_tree = parse_tree_for_language(path, bytes, language.clone())?;
+    let comment_lines = parsed_tree
+        .as_ref()
+        .map(|(_spec, tree)| collect_comment_lines(tree.root_node()));
+    let blocks = extract_inline_blocks(source, comment_lines.as_ref());
     if blocks.is_empty() {
         return Ok(Vec::new());
     }
@@ -1284,18 +1301,11 @@ fn parse_inline_contract_blob(
             .is_none_or(|scope| scope == InlineScope::Function)
     });
     if needs_function_binding {
-        let Some(spec) = language.clone() else {
+        let Some((spec, tree)) = parsed_tree.as_ref() else {
             bail!(
                 "{path}: function-scoped inline contracts require a supported Tree-sitter language"
             );
         };
-        let mut tree_parser = TsParser::new();
-        tree_parser
-            .set_language(&spec.language)
-            .with_context(|| format!("failed to load Tree-sitter language {}", spec.name))?;
-        let tree = tree_parser
-            .parse(bytes, None)
-            .with_context(|| format!("Tree-sitter failed to parse {path}"))?;
         functions = collect_function_candidates(tree.root_node(), source, spec.function_kinds);
     }
 
@@ -1359,6 +1369,24 @@ fn parse_inline_contract_blob(
         });
     }
     Ok(contracts)
+}
+
+fn parse_tree_for_language(
+    path: &str,
+    bytes: &[u8],
+    language: Option<LanguageSpec>,
+) -> Result<Option<(LanguageSpec, tree_sitter::Tree)>> {
+    let Some(spec) = language else {
+        return Ok(None);
+    };
+    let mut tree_parser = TsParser::new();
+    tree_parser
+        .set_language(&spec.language)
+        .with_context(|| format!("failed to load Tree-sitter language {}", spec.name))?;
+    let tree = tree_parser
+        .parse(bytes, None)
+        .with_context(|| format!("Tree-sitter failed to parse {path}"))?;
+    Ok(Some((spec, tree)))
 }
 
 fn inline_contracts_by_id(
@@ -1452,20 +1480,29 @@ fn ranges_intersect(ranges: &[LineRange], span: LineRange) -> bool {
     ranges.iter().any(|range| range.intersects(&span))
 }
 
-fn extract_inline_blocks(source: &str) -> Vec<InlineBlock> {
+fn extract_inline_blocks(
+    source: &str,
+    comment_lines: Option<&BTreeSet<usize>>,
+) -> Vec<InlineBlock> {
     let line_starts = line_start_offsets(source);
     let lines = source.lines().collect::<Vec<_>>();
     let mut blocks = Vec::new();
     let mut index = 0;
     while index < lines.len() {
-        if normalize_contract_comment_line(lines[index]) != "attest: begin" {
+        let line_number = index + 1;
+        if !line_can_host_inline_contract(comment_lines, line_number)
+            || normalize_contract_comment_line(lines[index]) != "attest: begin"
+        {
             index += 1;
             continue;
         }
-        let start_line = index + 1;
+        let start_line = line_number;
         let mut yaml_lines = Vec::new();
         index += 1;
         while index < lines.len() {
+            if !line_can_host_inline_contract(comment_lines, index + 1) {
+                break;
+            }
             let normalized = normalize_contract_comment_line(lines[index]);
             if normalized == "attest: end" {
                 let end_line = index + 1;
@@ -1487,6 +1524,10 @@ fn extract_inline_blocks(source: &str) -> Vec<InlineBlock> {
         index += 1;
     }
     blocks
+}
+
+fn line_can_host_inline_contract(comment_lines: Option<&BTreeSet<usize>>, line: usize) -> bool {
+    comment_lines.is_none_or(|comment_lines| comment_lines.contains(&line))
 }
 
 fn normalize_contract_comment_line(line: &str) -> String {
@@ -1587,6 +1628,30 @@ fn collect_function_candidates(
     collect_function_candidates_inner(root, source, function_kinds, &mut candidates);
     candidates.sort_by_key(|candidate| candidate.span.start_byte);
     candidates
+}
+
+fn collect_comment_lines(root: Node<'_>) -> BTreeSet<usize> {
+    let mut lines = BTreeSet::new();
+    collect_comment_lines_inner(root, &mut lines);
+    lines
+}
+
+fn collect_comment_lines_inner(node: Node<'_>, lines: &mut BTreeSet<usize>) {
+    if is_comment_node(node.kind()) {
+        for line in (node.start_position().row + 1)..=(node.end_position().row + 1) {
+            lines.insert(line);
+        }
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_comment_lines_inner(child, lines);
+    }
+}
+
+fn is_comment_node(kind: &str) -> bool {
+    matches!(kind, "comment" | "line_comment" | "block_comment")
 }
 
 fn collect_function_candidates_inner(

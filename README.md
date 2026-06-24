@@ -2,6 +2,8 @@
 
 Attest makes coding agents sign the staged commit before Git creates it.
 
+Use Attest for judgment calls about design, abstraction boundaries, and product expectations. Keep deterministic checks in normal CI.
+
 The v0 product is intentionally narrow:
 
 - directory contracts live in the repo as `AGENT_CONTRACT.yaml`
